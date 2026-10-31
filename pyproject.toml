@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sui-quant"
+version = "1.0.0"
+description = "SUI-Quant V1.0 Mathematical Quantitative Trading System (Spot SUIUSDT Only, Default PAPER/RESEARCH)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-v --tb=short"

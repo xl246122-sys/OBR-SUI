@@ -1,0 +1,41 @@
+# Credentials & Secrets (NEVER COMMIT)
+ServerStation-account.txt
+desktop.ini
+*.key
+*.pem
+*.secret
+*.credentials
+.env
+.env.*
+secrets/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.venv/
+venv/
+
+# Local research data & databases
+data/raw/
+data/processed/
+data/parquet/
+data/duckdb/
+data/sqlite/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+*.duckdb
+
+# Android build artifacts
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
