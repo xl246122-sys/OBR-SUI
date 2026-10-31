@@ -58,6 +58,7 @@ VALID_TRANSITIONS: dict[TradingState, frozenset[TradingState]] = {
     ),
     TradingState.ORDER_UNKNOWN: frozenset(
         {
+            TradingState.ORDER_SUBMITTED,
             TradingState.PARTIALLY_FILLED,
             TradingState.FILLED,
             TradingState.READY_NO_POSITION,
@@ -67,12 +68,20 @@ VALID_TRANSITIONS: dict[TradingState, frozenset[TradingState]] = {
     TradingState.FILLED: frozenset({TradingState.PROTECTION_PENDING}),
     TradingState.PROTECTION_PENDING: frozenset({TradingState.PROTECTED, TradingState.EXITING}),
     TradingState.PROTECTED: frozenset({TradingState.EXITING, TradingState.PROTECTION_PENDING}),
-    TradingState.EXITING: frozenset({TradingState.FLAT, TradingState.PROTECTION_PENDING}),
+    TradingState.EXITING: frozenset(
+        {
+            TradingState.FLAT,
+            TradingState.PROTECTION_PENDING,
+            TradingState.ORDER_UNKNOWN,
+        }
+    ),
     TradingState.FLAT: frozenset({TradingState.READY_NO_POSITION, TradingState.SYNCING}),
     # Leaving ENTRY_FROZEN or SECURITY_LOCKDOWN requires passing through SYNCING reconciliation gate
     TradingState.ENTRY_FROZEN: frozenset({TradingState.SYNCING, TradingState.EXITING}),
     TradingState.SECURITY_LOCKDOWN: frozenset({TradingState.SYNCING, TradingState.EXITING}),
 }
+
+ALLOWED_STATE_TRANSITIONS = VALID_TRANSITIONS
 
 
 @dataclass(frozen=True)
@@ -101,3 +110,33 @@ def assert_valid_transition(from_state: TradingState, to_state: TradingState) ->
         raise InvalidStateTransitionError(
             f"Illegal D-01 state transition: {from_state.value} -> {to_state.value}"
         )
+
+
+def prioritize_startup_reconciliation(
+    *,
+    has_open_position: bool,
+    has_active_protection_order: bool,
+    is_position_protectable: bool = True,
+    has_unknown_open_buy_order: bool = False,
+    rolling_24h_loss_exceeded: bool = False,
+    s01_lockdown_active: bool = False,
+) -> TradingState:
+    """Determine highest-priority target state during BOOT -> SYNCING reconciliation (§7, QA-05).
+
+    Guarantees that if a buy order filled right before a process crash, the naked position
+    immediately transitions to `PROTECTION_PENDING` with highest priority before any new signals.
+    """
+    if s01_lockdown_active:
+        return TradingState.SECURITY_LOCKDOWN
+    if has_open_position:
+        if not is_position_protectable:
+            return TradingState.ENTRY_FROZEN
+        if not has_active_protection_order:
+            return TradingState.PROTECTION_PENDING
+        return TradingState.PROTECTED
+    if has_unknown_open_buy_order:
+        return TradingState.ORDER_UNKNOWN
+    if rolling_24h_loss_exceeded:
+        return TradingState.ENTRY_FROZEN
+    return TradingState.READY_NO_POSITION
+

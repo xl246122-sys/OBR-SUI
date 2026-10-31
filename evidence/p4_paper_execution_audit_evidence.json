@@ -1,0 +1,49 @@
+{
+  "phase": "P4",
+  "generated_at_utc": "2026-10-31T08:13:33.499896+00:00",
+  "execution_mode_hard_lock": "PAPER",
+  "live_orders_sent_count": 0,
+  "real_account_api_keys_present": false,
+  "p3_statistical_verdict_carried_forward": "NO_EDGE",
+  "fault_injection_matrix": {
+    "FI-P4-01_QA03_r01_sizing_balance_protectability": "PASS",
+    "FI-P4-02_QA04a_never_filled_ttl_clean_cancel": "PASS",
+    "FI-P4-03_QA04b_partial_fill_40pct_sui_usdt_bnb_protection": "PASS",
+    "FI-P4-04_QA04c_micro_partial_fill_unprotectable_entry_frozen": "PASS",
+    "FI-P4-05_QA04d_order_unknown_idempotent_reconciliation": "PASS",
+    "FI-P4-06_QA05_crash_after_fill_startup_naked_position_recovery": "PASS",
+    "FI-P4-07_QA08_rolling_24h_loss_breaker_and_btcusdt_veto": "PASS",
+    "FI-P4-08_b01_markout_price_cap_stale_and_gap_window_filter": "PASS"
+  },
+  "runtime_risk_invariants": {
+    "INV-R1_zero_live_orders": true,
+    "INV-R2_suiusdt_symbol_uniqueness": true,
+    "INV-R3_mandatory_risk_verdict_binding": true,
+    "INV-R4_single_trade_025pct_risk_and_10pct_cap": true,
+    "INV-R5_rolling_24h_1pct_loss_circuit_breaker": true,
+    "INV-R6_order_unknown_zero_new_buys": true,
+    "INV-R7_open_position_mandatory_stop_protection": true,
+    "INV-R8_tick_step_and_price_cap_compliance": true
+  },
+  "latency_benchmark_200_cycles_ms": {
+    "d01_end_to_end": {
+      "p50_ms": 0.8684,
+      "p95_ms": 1.4064,
+      "p99_ms": 5.8846,
+      "slo_limit_ms": 150.0,
+      "passed": true
+    },
+    "r01_pre_trade_gate": {
+      "p50_ms": 0.0189,
+      "p95_ms": 0.0263,
+      "p99_ms": 0.0584,
+      "slo_limit_ms": 25.0,
+      "passed": true
+    },
+    "b01_limit_optimizer": {
+      "p50_ms": 0.0989,
+      "p95_ms": 0.1347,
+      "p99_ms": 0.2128
+    }
+  }
+}
