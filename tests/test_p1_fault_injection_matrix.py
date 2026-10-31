@@ -12,6 +12,10 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from sui_quant.config import RiskConfig
 from sui_quant.contracts import AlertSeverity, BreakoutProposal, DataQuality, OrderSide
 from sui_quant.daemon.alert_manager import AlertManager, DeliveryStatus
+from sui_quant.daemon.external_dms_live_probe import (
+    ExternalAlertWebhookSink,
+    ExternalCrossMachineProbe,
+)
 from sui_quant.daemon.external_probe import CloudHostBeaconSender, ExternalDeadMansSwitchEvaluator
 from sui_quant.daemon.heartbeat import F02Guardian, ServiceHeartbeat, SimulatedExchangeState
 from sui_quant.daemon.r01_server import R01RiskDaemon
@@ -501,7 +505,60 @@ def test_fi10_72h_accelerated_soak_and_resource_budget(tmp_path: Path) -> None:
         cycles_to_execute=720,
         work_dir=tmp_path / "soak",
     )
+    assert report["test_classification"] == "ACCELERATED_SIMULATION_ONLY"
+    assert report["is_real_72h_wallclock_proof"] is False
     assert report["final_trading_state"] == "READY_NO_POSITION"
     assert report["r01_risk_verdict_latency_ms"]["slo_passed"] is True
     assert report["r01_risk_verdict_latency_ms"]["p99"] <= 25.0
     assert report["memory_rss_mb"]["slope_mb_per_sim_hour"] <= 0.1
+
+
+def test_task_a4_external_probe_simulated_vs_real_blackout_and_receipt(tmp_path: Path) -> None:
+    """Task A.4 verification: separate classification and external receipt generation for
+    SIMULATED_BLACKOUT_DAEMON_SILENT vs REAL_HOST_UNREACHABLE_BLACKOUT.
+    """
+    receipts_file = tmp_path / "external_receipts.jsonl"
+    sink = ExternalAlertWebhookSink(receipts_jsonl_path=receipts_file, port=0)
+    webhook_url = sink.start()
+    try:
+        # 1. Simulated blackout: TCP port is reachable (using sink.port), but daemon is inactive/stale
+        probe_sim = ExternalCrossMachineProbe(
+            target_host="127.0.0.1",
+            target_port=sink.port,
+            webhook_url=webhook_url,
+            daemon_stale_threshold_sec=10.0,
+            tcp_timeout_sec=1.0,
+        )
+        res_sim = probe_sim.evaluate_remote_target(
+            fetch_remote_daemon_status_fn=lambda: {
+                "guardian_active_state": "inactive",
+                "guardian_heartbeat_age_sec": 45.2,
+                "r01_active_state": "active",
+            }
+        )
+        assert res_sim["healthy"] is False
+        assert res_sim["fault_classification"] == "SIMULATED_BLACKOUT_DAEMON_SILENT"
+        assert res_sim["receipt"]["http_status"] == 200
+        assert res_sim["receipt"]["fault_classification"] == "SIMULATED_BLACKOUT_DAEMON_SILENT"
+
+        # 2. Real transport-level unreachability: closed/unreachable TCP port (127.0.0.1:1)
+        probe_real = ExternalCrossMachineProbe(
+            target_host="127.0.0.1",
+            target_port=1,
+            webhook_url=webhook_url,
+            daemon_stale_threshold_sec=10.0,
+            tcp_timeout_sec=0.5,
+        )
+        res_real = probe_real.evaluate_remote_target(
+            fetch_remote_daemon_status_fn=lambda: {"guardian_active_state": "active"}
+        )
+        assert res_real["healthy"] is False
+        assert res_real["fault_classification"] == "REAL_HOST_UNREACHABLE_BLACKOUT"
+        assert res_real["receipt"]["http_status"] == 200
+        assert res_real["receipt"]["fault_classification"] == "REAL_HOST_UNREACHABLE_BLACKOUT"
+
+        lines = receipts_file.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 2
+    finally:
+        sink.stop()
+

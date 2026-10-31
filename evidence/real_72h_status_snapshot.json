@@ -1,0 +1,86 @@
+{
+  "test_classification": "REAL_WALLCLOCK_72H_OBSERVATION",
+  "is_accelerated_simulation": false,
+  "verification_status": "PENDING",
+  "pending_reason": "Real continuous 72h observation in progress: 180.3s / 259200s elapsed",
+  "started_at_utc": "2026-10-31T06:05:40.064449+00:00",
+  "latest_sample_utc": "2026-10-31T06:08:40.367140+00:00",
+  "target_completion_utc": "2026-11-03T06:05:40.064449+00:00",
+  "real_elapsed_seconds": 180.3,
+  "real_elapsed_hours": 0.0501,
+  "required_wallclock_hours": 72.0,
+  "completion_pct": 0.0696,
+  "total_samples_recorded": 4,
+  "latest_sample": {
+    "sample_seq": 4,
+    "sampled_at_utc": "2026-10-31T06:08:40.367140+00:00",
+    "started_at_utc": "2026-10-31T06:05:40.064449+00:00",
+    "real_elapsed_seconds": 180.3,
+    "real_elapsed_hours": 0.0501,
+    "cpu": {
+      "load_1m": 0.07,
+      "load_5m": 0.18,
+      "load_15m": 0.17
+    },
+    "memory": {
+      "mem_total_mib": 1962.49,
+      "mem_available_mib": 1417.27,
+      "mem_used_mib": 545.21,
+      "swap_total_mib": 2048.0,
+      "swap_used_mib": 0.46
+    },
+    "oom": {
+      "kernel_oom_kill_total": 0,
+      "oom_kill_delta_since_start": 0
+    },
+    "systemd_units": {
+      "sui-quant-r01.service": {
+        "active_state": "active",
+        "sub_state": "running",
+        "main_pid": 96453,
+        "rss_mib": 13.59,
+        "nrestarts": 0,
+        "started_utc": ""
+      },
+      "sui-quant-guardian.service": {
+        "active_state": "active",
+        "sub_state": "running",
+        "main_pid": 96454,
+        "rss_mib": 13.61,
+        "nrestarts": 0,
+        "started_utc": ""
+      }
+    },
+    "heartbeats": {
+      "db_exists": true,
+      "trading_state": "READY_NO_POSITION",
+      "services": {
+        "r01": {
+          "pid": 96453,
+          "boot_id": "SYS-96453",
+          "heartbeat_utc": "2026-10-31T06:08:36.207791+00:00",
+          "age_sec": 4.159,
+          "loop_tick_seq": 37,
+          "rss_mib": 31.22
+        },
+        "guardian": {
+          "pid": 96454,
+          "boot_id": "SYS-96454",
+          "heartbeat_utc": "2026-10-31T06:08:36.207973+00:00",
+          "age_sec": 4.159,
+          "loop_tick_seq": 37,
+          "rss_mib": 31.18
+        }
+      }
+    },
+    "disk": {
+      "root_total_gib": 48.584,
+      "root_free_gib": 40.385,
+      "root_used_pct": 12.58,
+      "state_dir_bytes": 489784,
+      "log_dir_bytes": 6601,
+      "state_dir_growth_bytes": 296640,
+      "log_dir_growth_bytes": 6601
+    }
+  }
+}

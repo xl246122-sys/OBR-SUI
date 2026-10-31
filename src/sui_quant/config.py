@@ -1,22 +1,27 @@
 """Risk boundary configuration and RESEARCH/SHADOW/PAPER/LIVE environment isolation gates (§0.1, §8.1, §16).
 
-P0 Remediation:
-- Upgraded `LiveAuthorizationToken` from plain SHA-256 to asymmetric Ed25519 digital signature verification
-  (`cryptography.hazmat.primitives.asymmetric.ed25519`), where the private key is held strictly offline by
-  the investor and never exists on the trading server or research repo.
-- Added anti-replay `token_id` (nonce) verification, `risk_config_sha256` parameter-tamper binding,
-  `git_commit_sha` code-version binding, and strict TTL ceiling (`<= 7 days`).
-- Added `SystemConfig.from_untrusted_mapping` proving that environment variable pollution, malformed dicts,
-  restart replay, or post-signing parameter tampering cannot bypass the PAPER default or LIVE gate.
+Task A.5 Trust-Boundary Hardening:
+1. Trusted Approver Public Key Isolation: `from_untrusted_mapping` strictly forbids `raw_config` or
+   `env_vars` from supplying or overriding `pinned_approver_pubkey_hex`, `consumed_token_ids`, or
+   `code_tree_sha256`. The trust-root public key must come only from the immutable code constant
+   `IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX` (default `None` = LIVE locked).
+2. Persistent On-Disk Replay Protection (`PersistentNonceRegistry`): Consumed `token_id` nonces are
+   atomically persisted to a local SQLite WAL table (`consumed_live_tokens`) on disk during
+   `verify_live_gate()`. Process restarts or config reloads cannot replay a previously used token.
+3. Runtime Trusted Build Binding (`compute_runtime_code_tree_sha256`): Instead of trusting a build hash
+   string inside a config file, `verify_live_gate()` hashes the actual `src/sui_quant/**/*.py` source tree
+   on disk at verification time and matches it against the Ed25519-signed `code_tree_sha256` in the token.
 """
 
 from __future__ import annotations
 
 import hashlib
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from enum import Enum
+from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from cryptography.exceptions import InvalidSignature
@@ -48,6 +53,123 @@ HARD_MAX_CAPITAL_ALLOCATION_PCT = Decimal("0.10")     # <= 10% account equity pe
 HARD_MAX_ROLLING_24H_LOSS_PCT = Decimal("0.01")       # 1.0% rolling 24h equity loss freeze threshold
 HARD_C1_NET_PROFIT_TARGET_PCT = Decimal("0.015")      # +1.5% net profit target for C1 baseline
 MAX_LIVE_TOKEN_TTL = timedelta(days=7)                # Maximum validity window for a single LIVE token
+
+# Immutable code-level trust root (Default None = LIVE permanently locked until investor pins public key in code)
+IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX: str | None = None
+
+# Keys that an untrusted configuration file/dict is NEVER allowed to supply or override
+FORBIDDEN_UNTRUSTED_CONFIG_KEYS = frozenset(
+    {
+        "pinned_approver_pubkey_hex",
+        "trusted_approver_pubkey_hex",
+        "consumed_token_ids",
+        "audited_git_commit_sha",
+        "runtime_code_tree_sha256",
+        "nonce_registry",
+    }
+)
+
+
+def compute_runtime_code_tree_sha256(package_dir: Path | None = None) -> str:
+    """Compute deterministic SHA-256 over all `.py` files in `src/sui_quant/` on disk at runtime.
+
+    Guarantees that if any Python source file is modified after token signing, the runtime code hash
+    will diverge from the signed `code_tree_sha256` inside `LiveAuthorizationToken`.
+    """
+    root = package_dir if package_dir is not None else Path(__file__).resolve().parent
+    hasher = hashlib.sha256()
+    py_files = sorted(p for p in root.rglob("*.py") if "__pycache__" not in p.parts)
+    if not py_files:
+        raise LiveAuthorizationError(f"No Python source files found under {root} for build verification")
+    for file_path in py_files:
+        rel_posix = file_path.relative_to(root).as_posix()
+        file_digest = hashlib.sha256(file_path.read_bytes()).hexdigest()
+        hasher.update(f"{rel_posix}:{file_digest}\n".encode("utf-8"))
+    return hasher.hexdigest()
+
+
+class PersistentNonceRegistry:
+    """SQLite WAL-backed persistent anti-replay store for consumed `LiveAuthorizationToken` IDs.
+
+    Survives process restarts and prevents a captured or reloaded `LiveAuthorizationToken` from
+    being activated more than once.
+    """
+
+    def __init__(self, db_path: str | Path) -> None:
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._init_db()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(str(self.db_path), timeout=5.0, isolation_level=None)
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=FULL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        return conn
+
+    def _init_db(self) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS consumed_live_tokens (
+                    token_id TEXT PRIMARY KEY,
+                    approver_id TEXT NOT NULL,
+                    code_tree_sha256 TEXT NOT NULL,
+                    consumed_at_utc TEXT NOT NULL
+                );
+                """
+            )
+        finally:
+            conn.close()
+
+    def is_consumed(self, token_id: str) -> bool:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM consumed_live_tokens WHERE token_id = ?",
+                (token_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
+    def consume_atomically(
+        self,
+        token_id: str,
+        approver_id: str,
+        code_tree_sha256: str,
+        consumed_at_utc: datetime,
+    ) -> None:
+        """Atomically record `token_id` as consumed; raises `LiveAuthorizationError` on replay."""
+        ensure_utc(consumed_at_utc, "consumed_at_utc")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT consumed_at_utc FROM consumed_live_tokens WHERE token_id = ?",
+                (token_id,),
+            ).fetchone()
+            if row is not None:
+                conn.execute("ROLLBACK")
+                raise LiveAuthorizationError(
+                    f"Persistent anti-replay block: token_id '{token_id}' was already consumed at {row[0]}"
+                )
+            conn.execute(
+                """
+                INSERT INTO consumed_live_tokens (token_id, approver_id, code_tree_sha256, consumed_at_utc)
+                VALUES (?, ?, ?, ?)
+                """,
+                (token_id, approver_id, code_tree_sha256, consumed_at_utc.isoformat()),
+            )
+            conn.execute("COMMIT")
+        except LiveAuthorizationError:
+            raise
+        except Exception as exc:
+            conn.execute("ROLLBACK")
+            raise LiveAuthorizationError(f"Failed to persist nonce to registry: {exc}") from exc
+        finally:
+            conn.close()
 
 
 @dataclass(frozen=True)
@@ -187,19 +309,7 @@ class GoNoGoChecklist:
 
 @dataclass(frozen=True)
 class LiveAuthorizationToken:
-    """Cryptographically signed user authorization artifact required to unlock LIVE mode (§16).
-
-    Security architecture:
-    1. Asymmetric Ed25519 signature (`ed25519_signature_hex`): The Ed25519 private signing key is
-       generated and stored strictly offline by the investor. The trading server and repository
-       never possess the private key, so neither a server compromise nor a rogue agent can forge
-       a token.
-    2. Anti-replay (`token_id`): Unique nonce ID checked against `consumed_token_ids` ledger.
-    3. Parameter-tamper binding (`risk_config_sha256` & `git_commit_sha`): Binds the signature to
-       the exact `RiskConfig.canonical_sha256()` and audited Git commit SHA.
-    4. Scope & TTL limits: Enforces `authorized_symbol == "SUIUSDT"`, caps `max_single_trade_risk_pct`
-       and `max_rolling_24h_loss_pct`, and restricts validity window to `<= 7 days`.
-    """
+    """Cryptographically signed user authorization artifact required to unlock LIVE mode (§16)."""
 
     token_id: str
     approver_id: str
@@ -254,18 +364,25 @@ class LiveAuthorizationToken:
         expected_risk: RiskConfig,
         pinned_approver_pubkey_hex: str | None,
         consumed_token_ids: Sequence[str] = (),
+        nonce_registry: PersistentNonceRegistry | None = None,
         expected_git_commit_sha: str | None = None,
+        verify_runtime_code_tree: bool = False,
+        code_package_dir: Path | None = None,
         now_utc: datetime | None = None,
     ) -> None:
         if not pinned_approver_pubkey_hex or len(pinned_approver_pubkey_hex) != 64:
             raise LiveAuthorizationError(
-                "LIVE mode blocked: No valid 32-byte Ed25519 approver public key is pinned."
+                "LIVE mode blocked: No valid 32-byte Ed25519 approver public key is pinned in trust root."
             )
         if not self.token_id.strip() or len(self.token_id.strip()) < 8:
             raise LiveAuthorizationError("token_id (nonce) must be at least 8 characters")
         if self.token_id in consumed_token_ids:
             raise LiveAuthorizationError(
                 f"Replay attack or duplicate token activation blocked: token_id '{self.token_id}' was already consumed."
+            )
+        if nonce_registry is not None and nonce_registry.is_consumed(self.token_id):
+            raise LiveAuthorizationError(
+                f"Persistent anti-replay block: token_id '{self.token_id}' is already recorded in on-disk registry."
             )
         if not self.approver_id.strip():
             raise LiveAuthorizationError("approver_id cannot be empty")
@@ -297,9 +414,18 @@ class LiveAuthorizationToken:
             raise LiveAuthorizationError(
                 f"Token max_rolling_24h_loss_pct ({dl}) exceeds RiskConfig ({expected_risk.max_rolling_24h_loss_pct})"
             )
+
         if not self.git_commit_sha.strip() or len(self.git_commit_sha.strip()) < 7:
-            raise LiveAuthorizationError("git_commit_sha must be a valid commit hash")
-        if expected_git_commit_sha is not None and self.git_commit_sha != expected_git_commit_sha:
+            raise LiveAuthorizationError("git_commit_sha must be a valid commit/tree hash")
+
+        if verify_runtime_code_tree:
+            live_tree_sha = compute_runtime_code_tree_sha256(code_package_dir)
+            if self.git_commit_sha != live_tree_sha:
+                raise LiveAuthorizationError(
+                    f"Runtime build binding failed: token build hash '{self.git_commit_sha}' "
+                    f"does not match on-disk code tree SHA-256 '{live_tree_sha}'"
+                )
+        elif expected_git_commit_sha is not None and self.git_commit_sha != expected_git_commit_sha:
             raise LiveAuthorizationError(
                 f"Token git_commit_sha '{self.git_commit_sha}' does not match audited build '{expected_git_commit_sha}'"
             )
@@ -344,6 +470,14 @@ class LiveAuthorizationToken:
                 "Ed25519 signature verification failed for LiveAuthorizationToken"
             ) from exc
 
+        if nonce_registry is not None:
+            nonce_registry.consume_atomically(
+                token_id=self.token_id,
+                approver_id=self.approver_id,
+                code_tree_sha256=self.git_commit_sha,
+                consumed_at_utc=ref_now,
+            )
+
 
 @dataclass(frozen=True)
 class SystemConfig:
@@ -354,9 +488,12 @@ class SystemConfig:
     allow_live_trading: bool = False
     go_no_go: GoNoGoChecklist = field(default_factory=GoNoGoChecklist)
     live_auth_token: LiveAuthorizationToken | None = None
-    pinned_approver_pubkey_hex: str | None = None
+    pinned_approver_pubkey_hex: str | None = IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX
     consumed_token_ids: tuple[str, ...] = field(default_factory=tuple)
+    nonce_registry: PersistentNonceRegistry | None = None
     audited_git_commit_sha: str | None = None
+    verify_runtime_code_tree: bool = False
+    code_package_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.mode, ExecutionMode):
@@ -388,7 +525,10 @@ class SystemConfig:
             expected_risk=self.risk,
             pinned_approver_pubkey_hex=self.pinned_approver_pubkey_hex,
             consumed_token_ids=self.consumed_token_ids,
+            nonce_registry=self.nonce_registry,
             expected_git_commit_sha=self.audited_git_commit_sha,
+            verify_runtime_code_tree=self.verify_runtime_code_tree,
+            code_package_dir=self.code_package_dir,
             now_utc=now_utc,
         )
 
@@ -397,15 +537,28 @@ class SystemConfig:
         cls,
         raw_config: Mapping[str, Any] | None = None,
         env_vars: Mapping[str, str] | None = None,
+        trusted_nonce_registry: PersistentNonceRegistry | None = None,
+        _trusted_pubkey_hex_override_for_test: str | None = None,
     ) -> SystemConfig:
-        """Safely parse configuration while guaranteeing env vars or untrusted dicts cannot bypass LIVE gates.
-
-        Environment variables (`SUI_QUANT_MODE`, `ALLOW_LIVE`, etc.) are explicitly forbidden from
-        escalating `mode` to `LIVE` or setting `allow_live_trading=True`.
+        """Safely parse configuration while guaranteeing untrusted dicts or env vars cannot replace
+        the trust-root public key, wipe the persistent nonce store, or spoof the runtime code hash.
         """
         data = dict(raw_config or {})
-        # Env vars may only request RESEARCH or PAPER, never LIVE!
+
+        # 1. Block any attempt by untrusted config to supply or replace trust-root parameters (Task A.5)
+        forbidden_present = FORBIDDEN_UNTRUSTED_CONFIG_KEYS.intersection(data.keys())
+        if forbidden_present:
+            raise LiveAuthorizationError(
+                f"Security violation: Untrusted config cannot supply or override trust-root keys: {sorted(forbidden_present)}"
+            )
+
+        # 2. Block any attempt by environment variables to enable LIVE or replace trust-root keys
         if env_vars:
+            for env_k in env_vars:
+                if "PUBKEY" in env_k.upper() or "TRUST_ROOT" in env_k.upper() or "COMMIT_SHA" in env_k.upper():
+                    raise LiveAuthorizationError(
+                        f"Security violation: Environment variable '{env_k}' cannot override trust root."
+                    )
             env_mode = env_vars.get("SUI_QUANT_MODE", "").strip().upper()
             if env_mode == "LIVE" or env_vars.get("ALLOW_LIVE", "").strip() in {"1", "true", "TRUE", "yes"}:
                 raise LiveAuthorizationError(
@@ -439,13 +592,24 @@ class SystemConfig:
         if not isinstance(allow_live, bool):
             raise LiveAuthorizationError("allow_live_trading must be a strict boolean")
 
+        if mode == ExecutionMode.LIVE and trusted_nonce_registry is None:
+            raise LiveAuthorizationError(
+                "LIVE mode via config loader requires a trusted on-disk PersistentNonceRegistry."
+            )
+
+        trusted_pubkey = (
+            _trusted_pubkey_hex_override_for_test
+            if _trusted_pubkey_hex_override_for_test is not None
+            else IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX
+        )
+
         return cls(
             mode=mode,
             risk=risk,
             allow_live_trading=allow_live,
             go_no_go=data.get("go_no_go", GoNoGoChecklist()),
             live_auth_token=data.get("live_auth_token"),
-            pinned_approver_pubkey_hex=data.get("pinned_approver_pubkey_hex"),
-            consumed_token_ids=tuple(data.get("consumed_token_ids", ())),
-            audited_git_commit_sha=data.get("audited_git_commit_sha"),
+            pinned_approver_pubkey_hex=trusted_pubkey,
+            nonce_registry=trusted_nonce_registry,
+            verify_runtime_code_tree=True,
         )

@@ -18,14 +18,18 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
+from pathlib import Path
+
 from sui_quant.config import (
     ExecutionMode,
     GoNoGoChecklist,
     LiveAuthorizationError,
     LiveAuthorizationToken,
+    PersistentNonceRegistry,
     RiskBoundaryViolationError,
     RiskConfig,
     SystemConfig,
+    compute_runtime_code_tree_sha256,
 )
 from sui_quant.contracts import (
     AlertEvent,
@@ -635,3 +639,120 @@ def test_other_core_contracts_instantiation() -> None:
         rollback_ref="A02-LOGREG-0.9.0",
     )
     assert mm.rollback_ref == "A02-LOGREG-0.9.0"
+
+
+def test_task_a5_trust_boundary_hardening_pubkey_persistence_and_code_tree(
+    tmp_path: Path,
+) -> None:
+    """Task A.5 Remediation Proof:
+    1. Untrusted config cannot inject or override `pinned_approver_pubkey_hex`, `consumed_token_ids`,
+       `audited_git_commit_sha`, `runtime_code_tree_sha256`, or `nonce_registry`.
+    2. Replay token protection is persisted on disk across restarts (`PersistentNonceRegistry`).
+    3. Runtime code-tree SHA-256 binding hashes actual `.py` files on disk and rejects tampered code.
+    """
+    # 1. Attempting to pass trust-root parameters via untrusted mapping or env_vars is strictly blocked
+    for forbidden_key in (
+        "pinned_approver_pubkey_hex",
+        "trusted_approver_pubkey_hex",
+        "consumed_token_ids",
+        "audited_git_commit_sha",
+        "runtime_code_tree_sha256",
+        "nonce_registry",
+    ):
+        with pytest.raises(LiveAuthorizationError, match="Untrusted config cannot supply or override trust-root keys"):
+            SystemConfig.from_untrusted_mapping(
+                raw_config={"mode": "PAPER", forbidden_key: "injected_value"}
+            )
+
+    with pytest.raises(LiveAuthorizationError, match="cannot override trust root"):
+        SystemConfig.from_untrusted_mapping(
+            raw_config={"mode": "PAPER"},
+            env_vars={"SUI_QUANT_PINNED_PUBKEY": "aa" * 32},
+        )
+
+    # 2. PersistentNonceRegistry persists consumed token_id across process restarts (SQLite WAL on disk)
+    db_file = tmp_path / "nonce_registry.db"
+    all_go = GoNoGoChecklist(
+        account_spot_suiusdt_verified=True,
+        protection_orders_fault_proven=True,
+        user_risk_limits_explicitly_approved=True,
+        anomaly_freeze_and_reconciliation_proven=True,
+        out_of_sample_net_positive_proven=True,
+        security_and_external_heartbeat_proven=True,
+        independent_audit_record_signed=True,
+    )
+    risk = RiskConfig()
+    priv_key = Ed25519PrivateKey.generate()
+    real_tree_sha = compute_runtime_code_tree_sha256()
+    token, pub_hex = _make_signed_live_token(
+        priv_key=priv_key,
+        risk=risk,
+        token_id="NONCE-PERSIST-001",
+        git_sha=real_tree_sha,
+    )
+
+    # Process #1 consumes NONCE-PERSIST-001 and commits it to SQLite WAL on disk
+    registry_instance_1 = PersistentNonceRegistry(db_file)
+    cfg1 = SystemConfig(
+        mode=ExecutionMode.LIVE,
+        risk=risk,
+        allow_live_trading=True,
+        go_no_go=all_go,
+        live_auth_token=token,
+        pinned_approver_pubkey_hex=pub_hex,
+        nonce_registry=registry_instance_1,
+        verify_runtime_code_tree=True,
+    )
+    assert cfg1.mode == ExecutionMode.LIVE
+    assert registry_instance_1.is_consumed("NONCE-PERSIST-001") is True
+
+    # Process #2 (simulated restart: brand-new PersistentNonceRegistry instance on same db_file,
+    # with empty in-memory consumed_token_ids=()) MUST reject the replayed token!
+    registry_instance_2 = PersistentNonceRegistry(db_file)
+    assert registry_instance_2.is_consumed("NONCE-PERSIST-001") is True
+    with pytest.raises(LiveAuthorizationError, match="Persistent anti-replay block"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=token,
+            pinned_approver_pubkey_hex=pub_hex,
+            consumed_token_ids=(),  # empty in-memory tuple after restart
+            nonce_registry=registry_instance_2,
+            verify_runtime_code_tree=True,
+        )
+
+    # 3. Runtime code-tree SHA-256 binding detects on-disk source code tampering
+    fake_pkg = tmp_path / "fake_pkg"
+    fake_pkg.mkdir()
+    mod_file = fake_pkg / "engine.py"
+    mod_file.write_text("VALUE = 1\n", encoding="utf-8")
+    tree_hash_before = compute_runtime_code_tree_sha256(fake_pkg)
+
+    # Sign a token bound to tree_hash_before
+    pkg_token, _ = _make_signed_live_token(
+        priv_key=priv_key,
+        risk=risk,
+        token_id="NONCE-PERSIST-002",
+        git_sha=tree_hash_before,
+    )
+
+    # Modify 1 character in engine.py on disk -> tree hash changes -> runtime build binding rejects token!
+    mod_file.write_text("VALUE = 2\n", encoding="utf-8")
+    tree_hash_after = compute_runtime_code_tree_sha256(fake_pkg)
+    assert tree_hash_before != tree_hash_after
+
+    with pytest.raises(LiveAuthorizationError, match="Runtime build binding failed"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=pkg_token,
+            pinned_approver_pubkey_hex=pub_hex,
+            verify_runtime_code_tree=True,
+            code_package_dir=fake_pkg,
+        )
+
+

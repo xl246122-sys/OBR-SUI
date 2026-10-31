@@ -68,3 +68,34 @@
 在 [`src/sui_quant/exchange_rules.py`](file:///D:/OBR-SUI/src/sui_quant/exchange_rules.py#L31-L162) 中新增 `FilterSourceType`：
 - `P0_SNAPSHOT_SUIUSDT_FILTERS` 显式标记为 `source = FilterSourceType.P0_STATIC_SNAPSHOT`。
 - 当运行时下单校验开启 `require_dynamic_freshness=True` 时，若仍使用 `P0_STATIC_SNAPSHOT` 或动态缓存年龄超过 `max_age_seconds`（默认 `3600s`），`assert_fresh_for_execution` 立即抛出 `StaleExchangeFilterError`，强制要求系统在 `BOOT -> SYNCING` 及周期刷新中调用 `SymbolFilters.from_binance_exchange_info_symbol(...)` 获取实时规则。
+
+---
+
+## 2. 任务 A.5 专项补强：P0 授权信任边界深度加固证据
+
+针对监理在 `任务A` 第 5 项指出的三项信任边界隐患（① 可信公钥不能被不可信配置替换、② 重放令牌持久化防护、③ 可信构建绑定生效），已在 [`src/sui_quant/config.py`](file:///D:/OBR-SUI/src/sui_quant/config.py) 与 [`tests/test_p0_contracts_and_gates.py`](file:///D:/OBR-SUI/tests/test_p0_contracts_and_gates.py) 完成如下代码级闭环加固：
+
+### 2.1 可信审批公钥不可被外部配置或环境变量替换
+- **代码常量锚定**：在 [`src/sui_quant/config.py`](file:///D:/OBR-SUI/src/sui_quant/config.py#L57-L70) 中定义代码级只读信任根常量 `IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX: str | None = None` 及禁止外部注入字段黑名单：
+  ```python
+  FORBIDDEN_UNTRUSTED_CONFIG_KEYS = frozenset(
+      {
+          "pinned_approver_pubkey_hex",
+          "trusted_approver_pubkey_hex",
+          "consumed_token_ids",
+          "audited_git_commit_sha",
+          "runtime_code_tree_sha256",
+          "nonce_registry",
+      }
+  )
+  ```
+- **强阻断逻辑**：在 [`SystemConfig.from_untrusted_mapping`](file:///D:/OBR-SUI/src/sui_quant/config.py#L536-L615) 中，若外部配置文件字典 `raw_config` 包含上述任意字段，或环境变量 `env_vars` 包含 `*PUBKEY*` / `*TRUST_ROOT*` / `*COMMIT_SHA*`，立即抛出 `LiveAuthorizationError("Security violation: Untrusted config cannot supply or override trust-root keys")`，彻底阻断“攻击者通过修改配置文件一并替换 `pinned_approver_pubkey_hex` 与 `live_auth_token`”的信任边界绕过路径。
+
+### 2.2 重放令牌跨重启磁盘持久化防护（`PersistentNonceRegistry`）
+- **SQLite WAL 原子持久化**：在 [`src/sui_quant/config.py`](file:///D:/OBR-SUI/src/sui_quant/config.py#L91-L173) 实现 [`PersistentNonceRegistry`](file:///D:/OBR-SUI/src/sui_quant/config.py#L91)，使用本地 SQLite WAL 表 `consumed_live_tokens(token_id PRIMARY KEY, approver_id, code_tree_sha256, consumed_at_utc)`。
+- **事务级防重放**：当 `LiveAuthorizationToken.validate()` 验签通过时，通过 `BEGIN IMMEDIATE` 独占写事务调用 `nonce_registry.consume_atomically(...)` 将 `token_id` 落盘；当进程重启、内存 `consumed_token_ids=()` 清空后，新进程实例重新挂载同一 SQLite 文件，任何旧令牌重放均被 `nonce_registry.is_consumed(token_id)` 拦截并抛出 `LiveAuthorizationError("Persistent anti-replay block")`。
+
+### 2.3 运行时真实代码树哈希绑定（`compute_runtime_code_tree_sha256`）
+- **实时源码树扫描**：在 [`src/sui_quant/config.py`](file:///D:/OBR-SUI/src/sui_quant/config.py#L73-L88) 实现 [`compute_runtime_code_tree_sha256`](file:///D:/OBR-SUI/src/sui_quant/config.py#L73)，不再信任配置文件中声称的 `audited_git_commit_sha` 字符串，而是在 `verify_live_gate()` 执行时刻直接遍历磁盘上 `src/sui_quant/**/*.py` 全部源码文件计算确定性聚合 SHA-256，并与 Ed25519 签名令牌中的 `git_commit_sha`（构建摘要）比对。磁盘上任意 `.py` 文件改动 1 个字符均立即触发 `LiveAuthorizationError("Runtime build binding failed")`。
+- **单元测试验证**：见 [`test_task_a5_trust_boundary_hardening_pubkey_persistence_and_code_tree`](file:///D:/OBR-SUI/tests/test_p0_contracts_and_gates.py#L644-L742)，已在 Windows 本地与日本 Ubuntu 服务器双端 `pytest` 通过。
+

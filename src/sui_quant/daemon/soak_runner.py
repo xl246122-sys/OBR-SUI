@@ -266,6 +266,12 @@ def run_accelerated_72h_soak(
         s01_sorted = sorted(s01_latencies_ms)
 
         report = {
+            "test_classification": "ACCELERATED_SIMULATION_ONLY",
+            "is_real_72h_wallclock_proof": False,
+            "warning": (
+                "Accelerated virtual-clock simulation only (~2.5s wall-clock for 2,160 ticks). "
+                "Cannot substitute for the real 72-hour continuous wall-clock observation."
+            ),
             "simulated_hours": simulated_hours,
             "cycles_executed": cycles_to_execute,
             "final_trading_state": store.get_trading_state().value,

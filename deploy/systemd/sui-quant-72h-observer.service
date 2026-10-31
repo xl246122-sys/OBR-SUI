@@ -1,0 +1,19 @@
+[Unit]
+Description=SUI-Quant V1.0 Real Continuous 72-Hour Wall-Clock Telemetry Observer
+After=network-online.target sui-quant-r01.service sui-quant-guardian.service
+Wants=sui-quant-r01.service sui-quant-guardian.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sui-quant
+Environment="PYTHONPATH=/opt/sui-quant/src"
+ExecStart=/usr/bin/python3 -m sui_quant.daemon.real_72h_observer --db-path /var/lib/sui-quant/state.db --log-dir /var/log/sui-quant --interval-sec 60
+Restart=always
+RestartSec=5s
+MemoryMax=96M
+CPUQuota=10%
+
+[Install]
+WantedBy=multi-user.target

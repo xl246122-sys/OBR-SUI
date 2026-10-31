@@ -121,16 +121,18 @@ flowchart TB
        - 若 `now_utc - last_beacon_utc > 90 秒`（连续丢失 3 个信标），**由 Cloudflare Worker 自身**直接判定 `SERVER_UNREACHABLE`；
        - 若信标中的 `manifest_root_sha256` 与 Worker KV 中锁定的合法发布哈希不一致，**由 Cloudflare Worker 自身**判定 `REMOTE_MANIFEST_TAMPERED`；
        - Worker 立即调用 **Firebase Cloud Messaging (FCM) HTTP v1 API** 向用户 Android 手机发送高优先级 `CRITICAL` 通知。
-  - **凭据单向隔离**：
-    - 日本云主机仅配置 `DMS_BEACON_WRITE_TOKEN`（仅具备向 Worker `/api/v1/beacon` 写入心跳的单一权限）。
-    - **FCM 服务端发送私钥（Service Account JSON）仅保存在 Cloudflare Worker 的加密环境变量（Secrets）中，日本云主机上完全不存在该凭据的副本**。因此即使日本云主机被 root 级入侵或彻底断电，攻击者既无法阻止外部超时告警，也无法窃取或吊销外部告警通道。
+  - **凭据单向隔离与 `root` 沦陷边界声明（Task A.6 修正）**：
+    - 日本云主机仅配置 `DMS_BEACON_WRITE_TOKEN`（仅具备向外部探测器发送信标的权限）。
+    - **外部通知凭据仅保存在外部独立探测域，日本云主机上完全不存在该凭据副本**：若日本云主机彻底断电、断网或内核崩溃，外部探测器必定因超时独立发出告警。
+    - **诚实安全边界声明（拒绝过度承诺）**：若攻击者已获取日本云主机的 **`root` 权限**，攻击者可从本机内存/配置提取 `DMS_BEACON_WRITE_TOKEN` 与历史 `manifest_root_sha256` 并伪造正常心跳信标，因此**外部 Dead-Man's Switch 仅能可靠检测“整机失联/进程崩溃/未伪造信标的普通篡改”，不能保证检测高级 `root` 攻击者的信标重放/伪造**。针对单机 `root` 沦陷的唯一有效兜底边界是机外隔离：P0/P1 零交易所私钥上云、实盘阶段币安服务端强制禁用提现权限 + 现货 `SUIUSDT` 白名单 + 子账户物理本金上限，详见 [`THREAT_MODEL.md §4`](file:///D:/OBR-SUI/docs/THREAT_MODEL.md)。
 
-#### (4) S-01 主机安全监控六大维度与“机外可信文件基线”
-- **解决“同机摘要可被一并篡改”的核心机制**：
+#### (4) S-01 主机安全监控六大维度与“机外签名文件基线”（含 `root` 威胁边界修正）
+- **防御非特权篡改与同机摘要伪造的机制**：
   1. **离线 Ed25519 签名发布清单（`signed_release_manifest.json`）**：在本地 Windows 11 研究机打包部署时，对所有受控代码文件（`src/sui_quant/**/*.py`）、系统服务配置（`deploy/systemd/*`）、SSH 加固配置（`/etc/ssh/sshd_config.d/01-security-hardening.conf`）及风控基线计算 SHA-256，并使用**仅存于本地 Windows 11 的离线 Ed25519 发布私钥**对整份清单生成数字签名 `manifest_ed25519_sig`。
-  2. **双重校验（本机公钥验签 + 外部信标比对）**：
-     - 云端 `S-01` 每 `60 秒` 重新计算上述受控文件的 SHA-256，并用硬编码的 Ed25519 公钥验证 `signed_release_manifest.json` 签名；
-     - 同时，`S-01` 将实时计算的受控文件聚合根哈希（`live_merkle_root_sha256`）放入每 30 秒发往外部 Cloudflare Worker 的信标中，由外部 Worker 与预设合法根哈希进行异地比对。即便攻击者获得了云主机 root 权限并同时修改了代码与本地校验脚本，外部 Worker 也会因根哈希失配或信标中断在 90 秒内触发 `CRITICAL` 入侵告警！
+  2. **双重校验（本机公钥验签 + 外部信标比对）及真实安全边界**：
+     - 云端 `S-01` 每 `60 秒` 重新计算上述受控文件的 SHA-256，并用代码级固定的 Ed25519 公钥验证 `signed_release_manifest.json` 签名；
+     - 同时，`S-01` 将实时计算的受控文件聚合根哈希（`live_merkle_root_sha256`）放入发往外部探测器的信标中。
+     - **【Task A.6 强制修正：明确 `root` 入侵局限性】**：上述 `S-01` 本地公钥验签与信标哈希比对，**仅能防御非 `root` 权限下的文件篡改、配置漂移、供应链中间人篡改或未修改 `S-01` 二进制/内存的普通入侵**。若攻击者已获得日本云主机的 `root` 权限，攻击者可直接修改 `S-01` 进程内存中的公钥常量、绕过本地校验并向外部伪造携带旧 `manifest_root_sha256` 的信标。本方案绝不声称任何单机内部软件机制能抵御同机 `root` 沦陷。
 - **S-01 六大巡检维度与响应矩阵**：
   | 巡检维度 | 检测数据源与频率 | 异常判定阈值 | 触发动作与安全状态 |
   |---|---|---|---|
@@ -224,7 +226,8 @@ flowchart TB
 | **FI-07** | **风控配置或代码被篡改（含同机摘要伪造攻击）** | `pytest tests/test_p1_fault_injection_matrix.py -k test_fi07_tampered_config_and_manifest`（修改配置并尝试伪造本地哈希，无离线 Ed25519 私钥） | 本机 `S-01` 因 Ed25519 签名验证失败立即识别篡改；同时外部探测器因 `manifest_root_sha256` 失配独立报警；系统立即锁定为 `SECURITY_LOCKDOWN` | `AlertEvent(dedup_key="S01_INTEGRITY_VIOLATION")` | `SECURITY_LOCKDOWN` |
 | **FI-08** | **守护服务或独立风控自身故障** | `pytest tests/test_p1_fault_injection_matrix.py -k test_fi08_guardian_and_r01_self_failure`（分别注入 `R-01` 失联与 `guardian` 失联） | ① `R-01` 失联 `> 10s` 或 IPC 超时 `> 25ms`：`D-01` 立即 Fail-Closed 进入 `ENTRY_FROZEN`；② `guardian` 失联 `> 15s`：`R-01` 反向看门狗立即收回开仓许可并拉起告警 | `state_transitions` 记录 `R01_HEARTBEAT_LOST` / `GUARDIAN_LOST` | `ENTRY_FROZEN` |
 | **FI-09** | **多次重启风暴与告警风暴抑制** | `pytest tests/test_p1_fault_injection_matrix.py -k test_fi09_crash_loop_and_alert_storm`（连续注入 6 次崩溃与 100 条重复异常） | 5 分钟内第 5 次崩溃触发熔断器停止无限重启并锁定 `ENTRY_FROZEN`；100 条重复告警被冷却去重合并为 1 条活动告警（`occurrence_count=100`），推送通道不拥塞 | `alert_events` 表 `occurrence_count == 100` 且实际外发次数 `== 1` | `ENTRY_FROZEN` |
-| **FI-10** | **72 小时稳定性与资源压力测试** | 压测命令：`python -m sui_quant.daemon.soak_runner --duration-hours 72`（P1 初验先跑加速仿真压测 + 云端开启 72h 连续观察窗口） | 连续运行期间各进程 RSS 严格 `<= MemoryHigh`，无内存泄漏（线性回归斜率 `<= 0.1 MB/h`），FD 句柄数稳定，心跳 P99 抖动 `<= 20ms`，零漏检 | `/var/log/sui-quant/soak_metrics.jsonl` 性能分位数报告 | 超内存上限由 `systemd` 隔离重启并进 `SYNCING` |
+| **FI-10A** | **72 小时加速模拟与资源回归压测（`ACCELERATED_SIMULATION_ONLY`）** | `python -m sui_quant.daemon.soak_runner --mode soak --duration-hours 72 --cycles 2160`（**严禁与真实 72 小时墙钟运行混用**） | 仅验证 2,160 个虚拟时钟周期的快速逻辑回归：RSS 线性斜率 `<= 0.1 MB/h`、FD 句柄不泄漏、`R-01` P99 `<= 25ms` | 输出 JSON 强制包含 `"is_real_72h_wallclock_proof": false` | 逻辑回归失败阻断提交 |
+| **FI-10B** | **日本服务器真实连续 72 小时墙钟稳定性运行观测（`REAL_WALLCLOCK_72H_OBSERVATION`）** | `systemctl status sui-quant-72h-observer.service`（运行 `sui_quant.daemon.real_72h_observer` 每 60s 采样，持续 259,200 真实秒） | 必须满 `72.0` 真实墙钟小时（`259,200s`）且期间 `oom_kill_delta == 0`、异常重启 `== 0`、心跳正常，状态方可由 `PENDING` 转为 `PASS` | `/var/log/sui-quant/real_72h_observation.jsonl` 与 `real_72h_status.json` | 未满 72 真实小时前严格保持 **`PENDING`** |
 
 ---
 
@@ -238,11 +241,15 @@ flowchart TB
 
 ---
 
-## 09 未验证假设及阻塞项（只列真正影响执行的事项）
+## 09 未验证假设及未完成项（严格标记为 `PENDING`，绝不伪报 `PASS`）
 
-- **P1 阶段无阻断级未决项（0 Blockers）**：
-  - 本地代码库、Ed25519 离线签名工具链、模拟交易所对账器及日本云主机 SSH 访问均已就绪。
-  - 外部存活探测器的逻辑将在 P1 以标准无状态 Worker 模块 + 本地/云端端到端集成测试完整实现；具体绑定用户的 FCM 生产凭据可在 P7（Android App 阶段）或用户指定时填入。
+1. **`PENDING` — 日本服务器真实连续 72 小时墙钟稳定性观测（`FI-10B`）**：
+   - `sui-quant-72h-observer.service` 已在日本服务器（`<JAPAN_CLOUD_IP_REDACTED>`）启动并持续写入真实采样记录（`/var/log/sui-quant/real_72h_observation.jsonl`），但在真实流逝时间未满 `259,200 秒`（72.0 小时）前，该验收项严格标记为 **`PENDING`**，绝不用 `FI-10A` 加速模拟替代。
+2. **`PENDING` — 第三方公有云 Serverless（Cloudflare Workers 账号）与移动端 FCM 生产推送凭据**：
+   - 跨物理机器的外部 Dead-Man's Switch 探测（独立 Windows 11 外部故障域 <-> 日本云主机 `<JAPAN_CLOUD_IP_REDACTED>`）及外部本地 Webhook 回执已完成真实断联与模拟失联实测（**`PASS`**）；
+   - 但由于当前仓库未提供用户的 Cloudflare API Token 与 Google Firebase (FCM) 生产私钥，Cloudflare 边缘生产部署与手机端 FCM 实网推送回执严格标记为 **`PENDING`（`PENDING_USER_CLOUDFLARE_AND_PUSH_CREDENTIALS`）**。
+3. **`PENDING` — 币安账户私有 API 权限与子账户风控核验（`QA-02`）**：
+   - 当前严格遵循零交易密钥（Zero-Key Policy）与 `PAPER` 模式，未接入任何真实币安 API Key，故 `QA-02` 保持 **`PENDING`**。
 
 ---
 
