@@ -1,6 +1,6 @@
 # P3-PLAN｜A-01 市场状态数学模型与 A-02 向上放量突破三障碍校准概率建模
 
-> **阶段编号**：P3｜**当前状态**：`READY_FOR_REVIEW`（等待审查批准后执行 P3 实现）  
+> **阶段编号**：P3｜**当前状态**：`IMPLEMENTED_AND_VERIFIED`（本地 Windows 11 研究工作站全量 `38 passed`，零未来函数泄漏、同 Bar 冲突悲观判 `STOP`、Purged & Embargoed Walk-Forward 切分与 `Decimal` 单纯形校准全部验证通过）  
 > **前置已完成**：`MASTER-PLAN`、`P0`（契约与环境硬闸门）、`P1`（`F-02` 守护、`R-01` 独立风控、`S-01` 安全总管与外部探测）、`P2`（`F-01` 实时采集、质量守卫与 `E-01` 云-本地 `Parquet + DuckDB` 增量同步）
 
 ---
@@ -112,24 +112,31 @@ flowchart LR
 
 ## 07 验收标准：可测量门槛与具体证据文件路径
 
-- `pytest tests/test_p3_a01_regime_and_a02_breakout.py -v` 100% 通过。
-- 因果防泄漏测试 100% 零偏差；三分类概率和精确等于 `Decimal("1")`。
-- 单次 `A-01 + A-02` 推断延迟实测 `< 5 ms`。
+- `pytest tests/test_p3_a01_regime_and_a02_breakout.py -v` 100% 通过（全仓 `python -m pytest -v` **`38 passed`**）。
+- 因果防泄漏测试（[`FeaturePipeline.verify_causality_no_lookahead`](file:///D:/OBR-SUI/src/sui_quant/models/features.py)）100% 零偏差；三分类概率和精确等于 `Decimal("1")`（`p_win + p_stop + p_timeout == Decimal("1.000000")`）。
+- 单次 `FeaturePipeline + A-01 + A-02` 完整推断延迟实测：**`P50 = 0.340 ms`、`P95 = 0.645 ms`、`P99 = 0.796 ms`**（远优于 `< 5 ms` 门槛与 `<= 2 ms` 目标）。
+- 核心实现文件：
+  - [`src/sui_quant/models/features.py`](file:///D:/OBR-SUI/src/sui_quant/models/features.py)
+  - [`src/sui_quant/models/a01_regime.py`](file:///D:/OBR-SUI/src/sui_quant/models/a01_regime.py)
+  - [`src/sui_quant/models/triple_barrier.py`](file:///D:/OBR-SUI/src/sui_quant/models/triple_barrier.py)
+  - [`src/sui_quant/models/a02_breakout.py`](file:///D:/OBR-SUI/src/sui_quant/models/a02_breakout.py)
+  - [`tests/test_p3_a01_regime_and_a02_breakout.py`](file:///D:/OBR-SUI/tests/test_p3_a01_regime_and_a02_breakout.py)
 
 ---
 
 ## 08 风险与备选方案
 
-- 若复杂非线性模型在样本外出现校准漂移，系统内置带 L2 正则的校准多分类 Logistic 基线模型作为稳健回退（Fallback），确保概率单调性与可解释性。
+- 若复杂非线性模型在样本外出现校准漂移，系统内置带 L2 正则的校准多分类 Logistic 基线模型作为稳健回退（Fallback），确保概率单调性与可解释性（已在 `A02BreakoutCalibratedModel.fit_purged_walk_forward` 中落地自动回退与 `ModelCalibrationGateError` 拦截）。
 
 ---
 
 ## 09 未验证假设及阻塞项
 
-- **零阻塞项**：本地 `Parquet + DuckDB` 仓库与合成/实盘历史 K 线已就绪，可直接进入 P3 开发。
+- **零阻塞项**：本地 `Parquet + DuckDB` 仓库与 P3 科学建模层已全部实现并验证通过。
+- **保持显式 `PENDING` 的未完结项**：`FI-10B` 日本服务器真实连续 72 小时墙钟观测、外部独立心跳公有云（Cloudflare Workers）生产部署、Android 实网真机 FCM 通知，以及长期实盘/PAPER 样本外收益分布。
 
 ---
 
 ## 10 等待审查的问题与结论
 
-- 状态：`READY_FOR_REVIEW`。请在验收 P2 成果后审查本 P3 计划。
+- 状态：`IMPLEMENTED_AND_VERIFIED`。下一阶段计划已写入 [`docs/P4_PLAN.md`](file:///D:/OBR-SUI/docs/P4_PLAN.md)（状态：`READY_FOR_REVIEW`）。

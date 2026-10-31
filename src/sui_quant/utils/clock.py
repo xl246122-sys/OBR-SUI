@@ -12,8 +12,8 @@ def utc_now() -> datetime:
 
 
 def monotonic_ns() -> int:
-    """Return monotonic clock in nanoseconds for intra-process latency measurement."""
-    return time.monotonic_ns()
+    """Return high-resolution monotonic clock in nanoseconds for intra-process latency measurement."""
+    return time.perf_counter_ns()
 
 
 def ensure_utc(dt: datetime, field_name: str = "timestamp") -> datetime:
