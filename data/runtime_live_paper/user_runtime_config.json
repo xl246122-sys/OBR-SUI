@@ -1,0 +1,10 @@
+{
+  "total_capital_usdt": "1000.00",
+  "single_order_usdt": "100.00",
+  "max_position_pct": "10.00",
+  "stop_loss_pct": "1.00",
+  "take_profit_pct": "1.50",
+  "updated_at_utc": "2026-10-31T13:16:53.309188+00:00",
+  "live_trading_enabled": false,
+  "execution_mode": "PAPER"
+}

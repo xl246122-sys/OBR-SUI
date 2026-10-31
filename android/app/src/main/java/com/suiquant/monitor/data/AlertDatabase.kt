@@ -11,8 +11,7 @@ import androidx.room.RoomDatabase
 import kotlinx.coroutines.flow.Flow
 
 /**
- * Room offline cache entity for HIGH / CRITICAL alerts and daily digest items (§12.1, QA-11).
- * Persists alerts across app restarts and offline periods until acknowledged as DELIVERED.
+ * Room offline cache entity for HIGH / CRITICAL / INFO alerts (§12.1, QA-11).
  */
 @Entity(tableName = "alerts")
 data class AlertEntity(
@@ -25,40 +24,66 @@ data class AlertEntity(
     val lastSeenUtc: String,
     val occurrenceCount: Int,
     val deliveryStatus: String,        // "PENDING", "SENT_AWAITING_ACK", "DELIVERED"
-    val presentationChannel: String,   // "FOREGROUND_MODAL_DIALOG", "BACKGROUND_SYSTEM_NOTIFICATION", "IN_APP_PERMISSION_FALLBACK_BANNER"
+    val presentationChannel: String,
     val actionsTakenJson: String,
     val sanitizedDetailsJson: String,
     val userDismissedModal: Boolean = false
 )
 
 /**
- * Room offline cache entity for the latest read-only status summary snapshot (`GET /api/v1/status/summary`).
+ * Room offline cache entity for the latest status summary snapshot (`GET /api/v1/status/summary`).
+ * Holds independent PAPER and LIVE position configs, active positions, and PnL.
  */
 @Entity(tableName = "status_snapshots")
 data class StatusSnapshotEntity(
     @PrimaryKey val snapshotKey: String = "LATEST",
     val generatedAtUtc: String,
-    val executionMode: String,         // Strictly "PAPER"
-    val tradingSymbol: String,         // Strictly "SUIUSDT"
-    val tradingState: String,
-    val allowNewEntry: Boolean,
-    val latestRegime: String,
-    val latestRegimeConfidence: String,
-    val activePaperBundleId: String,
-    val activePaperExitVersion: String,
-    val shadowBundleId: String?,
-    val pinnedPositionExitVersion: String?,
-    val hasActivePosition: Boolean,
-    val rolling24hDrawdownPct: String,
-    val maxRolling24hLossLimitPct: String,
-    val undeliveredAlertsCount: Int,
-    val wsStreamHealthy: Boolean,
-    val f02HeartbeatHealthy: Boolean
+    val executionMode: String,         // "PAPER" (default) or "LIVE"
+    val liveTradingEnabled: Boolean = false,
+    val tradingSymbol: String = "SUIUSDT",
+    val suiBid: String = "0.0000",
+    val suiAsk: String = "0.0000",
+    val suiLastPrice: String = "0.0000",
+    val btcLastPrice: String = "0.00",
+    val tradingState: String = "READY_NO_POSITION",
+    val allowNewEntry: Boolean = true,
+    val latestRegime: String = "RANGING_NORMAL",
+    val latestRegimeConfidence: String = "0.8120",
+    val activePaperBundleId: String = "B-SUI-5M-V1.0",
+    val activePaperExitVersion: String = "C1-v1.0",
+    val shadowBundleId: String? = "B-SUI-5M-V2.0-SHADOW",
+    val pinnedPositionExitVersion: String? = null,
+    val hasActivePosition: Boolean = false,
+    val activePositionSummary: String = "当前空仓 (FLAT)",
+    val realizedPnlUsdt: String = "0.0000",
+    val rolling24hDrawdownPct: String = "0.000000",
+    val maxRolling24hLossLimitPct: String = "0.01",
+    val undeliveredAlertsCount: Int = 0,
+    val wsStreamHealthy: Boolean = true,
+    val f02HeartbeatHealthy: Boolean = true,
+    // Independent PAPER Workspace State & Config
+    val paperHasActivePosition: Boolean = false,
+    val paperActivePositionSummary: String = "模拟盘当前空仓 (FLAT) — 实时扫描 SUIUSDT 信号中",
+    val paperRealizedPnlUsdt: String = "0.0000",
+    val totalCapitalUsdt: String = "1000.00",
+    val singleOrderUsdt: String = "100.00",
+    val maxPositionPct: String = "10.00",
+    val stopLossPct: String = "1.00",
+    val takeProfitPct: String = "1.50",
+    // Independent LIVE Workspace State & Config
+    val liveHasActivePosition: Boolean = false,
+    val liveActivePositionSummary: String = "实盘当前空仓 (FLAT) — 实盘开关开启后按配置执行",
+    val liveRealizedPnlUsdt: String = "0.0000",
+    val liveTotalCapitalUsdt: String = "500.00",
+    val liveSingleOrderUsdt: String = "50.00",
+    val liveMaxPositionPct: String = "10.00",
+    val liveStopLossPct: String = "1.00",
+    val liveTakeProfitPct: String = "1.50"
 )
 
 @Dao
 interface AlertDao {
-    @Query("SELECT * FROM alerts WHERE severity IN ('HIGH', 'CRITICAL') ORDER BY alertSeq DESC")
+    @Query("SELECT * FROM alerts ORDER BY alertSeq DESC")
     fun observeHighAndCriticalAlerts(): Flow<List<AlertEntity>>
 
     @Query("SELECT * FROM alerts WHERE severity IN ('HIGH', 'CRITICAL') AND userDismissedModal = 0 ORDER BY alertSeq ASC")
@@ -84,11 +109,14 @@ interface AlertDao {
 
     @Query("SELECT * FROM status_snapshots WHERE snapshotKey = 'LATEST' LIMIT 1")
     fun observeLatestStatusSnapshot(): Flow<StatusSnapshotEntity?>
+
+    @Query("SELECT * FROM status_snapshots WHERE snapshotKey = 'LATEST' LIMIT 1")
+    suspend fun getLatestStatusSnapshotNow(): StatusSnapshotEntity?
 }
 
 @Database(
     entities = [AlertEntity::class, StatusSnapshotEntity::class],
-    version = 1,
+    version = 3,
     exportSchema = false
 )
 abstract class AlertDatabase : RoomDatabase() {

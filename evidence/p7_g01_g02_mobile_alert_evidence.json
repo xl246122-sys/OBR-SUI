@@ -20,12 +20,12 @@
   },
   "gateway_slo_and_memory_benchmark": {
     "total_api_calls_measured": 410,
-    "query_p50_ms": 0.2836,
-    "query_p95_ms": 0.3506,
-    "query_p99_ms": 0.4253,
+    "query_p50_ms": 0.2738,
+    "query_p95_ms": 0.3549,
+    "query_p99_ms": 0.3972,
     "query_p99_budget_ms": 5.0,
-    "memory_delta_mib": 0.0349,
-    "memory_peak_traced_mib": 0.046,
+    "memory_delta_mib": 0.0342,
+    "memory_peak_traced_mib": 0.0452,
     "memory_budget_limit_mib": 30.0
   },
   "cross_phase_pending_items": {

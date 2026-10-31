@@ -1,0 +1,473 @@
+{
+  "phase": "P8",
+  "generated_at_utc": "2026-10-31T10:30:00+00:00",
+  "execution_mode_locked": "PAPER",
+  "live_orders_sent_count": 0,
+  "real_account_api_keys_present": false,
+  "runtime_code_tree_sha256": "13f83444826f32060e31d6f2d88a0840d555c804de856d7a5090776160cdb1c4",
+  "risk_config_version": "1.0.0-candidate",
+  "risk_config_sha256": "06f3a48b8405cdc5e3d61757aac28cbaf9d97ca2d982341e43747f667a34a044",
+  "p3_p5_statistical_verdict": "NO_EDGE",
+  "fi_10b_72h_wallclock_status": "PENDING",
+  "fi_10b_elapsed_hours": 1.0684,
+  "overall_release_decision": "NO_GO_STAY_IN_PAPER",
+  "live_gate_blocked_verified": true,
+  "live_gate_block_reason": "LIVE mode blocked: Section 16 GO/NO-GO checklist is incomplete (NO-GO).",
+  "blocking_reasons": [
+    "STATISTICAL_NO_EDGE: P3/P5 60-day real historical FINAL_TEST net expectancy is negative (mean_realized=-0.007098, C1=-71.89 bps).",
+    "FI_10B_AND_EXTERNAL_CLOUD_PENDING: Tokyo server 72h real wall-clock soak is at 1.07h / 72.0h (PENDING); public Cloudflare Workers & Firebase production credentials pending.",
+    "PRIVATE_ACCOUNT_VERIFICATION_PENDING: Zero production exchange API keys present in repository.",
+    "INVESTOR_LIVE_TOKEN_UNSIGNED: IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX is None and no LiveAuthorizationToken is signed."
+  ],
+  "go_no_go_checklist": {
+    "account_spot_suiusdt_verified": false,
+    "protection_orders_fault_proven": true,
+    "user_risk_limits_explicitly_approved": false,
+    "anomaly_freeze_and_reconciliation_proven": true,
+    "out_of_sample_net_positive_proven": false,
+    "security_and_external_heartbeat_proven": false,
+    "independent_audit_record_signed": false,
+    "all_passed": false
+  },
+  "go_no_go_gate_audits": [
+    {
+      "gate_id": "GATE-01",
+      "checklist_field": "account_spot_suiusdt_verified",
+      "title": "实盘账户现货权限、VIP 费率与 OCO/STOP_LOSS_LIMIT 实网核验",
+      "passed": false,
+      "verification_classification": "PENDING_EXTERNAL_OR_WALLCLOCK",
+      "evidence_summary": "公开 exchangeInfo 过滤器已在 P0 实测确认；但因严格执行零生产密钥策略，私有账户 /api/v3/account 权限与专属费率尚未接入实网核验，诚实保持 False (PENDING)。"
+    },
+    {
+      "gate_id": "GATE-02",
+      "checklist_field": "protection_orders_fault_proven",
+      "title": "保护订单（-1% 止损 / OCO / 分批重锁 / 闪崩应急平仓）故障注入验证",
+      "passed": true,
+      "verification_classification": "PROVEN_IN_PAPER",
+      "evidence_summary": "已在 P4 (FI-P4-03/04/06) 与 P5 (QA-06/QA-07) 100% 验证通过：部分成交立即挂止损单、分批止盈零超锁、闪崩跳空与拒单应急平仓零裸仓。"
+    },
+    {
+      "gate_id": "GATE-03",
+      "checklist_field": "user_risk_limits_explicitly_approved",
+      "title": "投资人明确签署实盘资金上限与风险限额 (Ed25519 硬件/离线签名令牌)",
+      "passed": false,
+      "verification_classification": "NOT_SIGNED_BY_INVESTOR",
+      "evidence_summary": "IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX 保持 None，投资人尚未签发 LiveAuthorizationToken，且在 NO_EDGE 消除前严禁诱导签署。"
+    },
+    {
+      "gate_id": "GATE-04",
+      "checklist_field": "anomaly_freeze_and_reconciliation_proven",
+      "title": "异常自动冻结 (ENTRY_FROZEN / SECURITY_LOCKDOWN) 与重启 SYNCING 对账恢复",
+      "passed": true,
+      "verification_classification": "PROVEN_IN_PAPER",
+      "evidence_summary": "已在 P1/P4/P7 100% 验证通过：24h 亏损熔断、ORDER_UNKNOWN 幂等对账、崩溃重启裸仓优先保护、以及移动端 Ed25519 签名紧急锁仓（保留在途 -1% 止损卖单）均通过。"
+    },
+    {
+      "gate_id": "GATE-05",
+      "checklist_field": "out_of_sample_net_positive_proven",
+      "title": "扣除全部真实交易成本与滑点后的独立样本外净期望显著为正",
+      "passed": false,
+      "verification_classification": "NO_EDGE_BLOCKER",
+      "evidence_summary": "P3/P5 60 天币安现货真实历史数据独立测试集 FINAL_TEST (115 笔) 净期望为负 (P3 mean_realized=-0.007098, P5 Layer1 C1=-71.89 bps)，统计裁决严格为 NO_EDGE，构成实盘准入的核心否决项。"
+    },
+    {
+      "gate_id": "GATE-06",
+      "checklist_field": "security_and_external_heartbeat_proven",
+      "title": "服务器安全加固、日本云主机连续 72 小时真实墙钟运行 (FI-10B) 与公有云外部心跳",
+      "passed": false,
+      "verification_classification": "PENDING_EXTERNAL_OR_WALLCLOCK",
+      "evidence_summary": "日本东京服务器真实连续 72h 观测 FI-10B 当前进度 1.07h / 72.0h (状态 PENDING)，且公有云 Cloudflare Workers / 真实 FCM 生产凭据未配置，诚实保持 False。"
+    },
+    {
+      "gate_id": "GATE-07",
+      "checklist_field": "independent_audit_record_signed",
+      "title": "独立总审计记录完成且全部前置门禁无阻塞签发",
+      "passed": false,
+      "verification_classification": "NO_EDGE_BLOCKER",
+      "evidence_summary": "P8 终审器已完成全量证据核验，但因 GATE-01、GATE-03、GATE-05 (NO_EDGE)、GATE-06 (PENDING) 未满足，总审计器严格拒绝签发实盘放行许可，锁定 NO_GO_STAY_IN_PAPER。"
+    }
+  ],
+  "qa_verification_matrix": {
+    "QA-01": {
+      "qa_id": "QA-01",
+      "title": "行情重复、乱序、缺失、失联、重连与 K 线收盘去重",
+      "responsible_phases": [
+        "P0",
+        "P2"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_ON_PUBLIC_STREAMS",
+      "key_metrics": {
+        "duplicate_and_out_of_order_rejection": "100%",
+        "unclosed_kline_isolation": "STRICT_PHYSICAL_ISOLATION",
+        "orderbook_gap_tag": "GAP_UNRECOVERABLE_FOR_FILL_CALIBRATION",
+        "ws_23h_dual_conn_rotation_gaps": 0
+      },
+      "evidence_files": [
+        "tests/test_p2_f01_collector_and_sync.py"
+      ],
+      "honest_notes": "P0/P2 已验证重复与乱序事件拒收、未收盘 K 线物理隔离、收盘唯一触发、断联期间盘口不可恢复标记及 23h 双连接热轮换零缺口。"
+    },
+    "QA-02": {
+      "qa_id": "QA-02",
+      "title": "100ms 部分盘口正常处理、背压不无限增长、数据质量停新仓与私有账户核验",
+      "responsible_phases": [
+        "P0",
+        "P2"
+      ],
+      "status": "PARTIAL_PASS_PENDING",
+      "engineering_verified": true,
+      "statistical_or_external_status": "PRIVATE_ACCOUNT_API_KEY_PENDING",
+      "key_metrics": {
+        "ring_buffer_bounded": true,
+        "high_watermark_80pct_degrade_to_1000ms": true,
+        "stale_data_halts_new_entry": true,
+        "private_account_api_verified": false
+      },
+      "evidence_files": [
+        "docs/API_CAPABILITY_MATRIX.md",
+        "tests/test_p2_f01_collector_and_sync.py"
+      ],
+      "honest_notes": "100ms 盘口采集、有界 RingBuffer、80% 水位自动降级 1000ms 及过期数据停新仓已验证 PASS；币安私有账户级 API 权限实网核验因零生产密钥策略诚实保持 PENDING。"
+    },
+    "QA-03": {
+      "qa_id": "QA-03",
+      "title": "价格/数量 tick、step、最小名义额、实际费率、资金不足与买前可保护性校验",
+      "responsible_phases": [
+        "P0",
+        "P4"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "tick_size": "0.0001",
+        "step_size": "0.1",
+        "min_notional_usdt": "5.0",
+        "pre_buy_protectability_guard": "PASS",
+        "fee_modes_verified": [
+          "SUI",
+          "USDT",
+          "BNB"
+        ]
+      },
+      "evidence_files": [
+        "evidence/p4_paper_execution_audit_evidence.json",
+        "tests/test_p4_b01_d01_r01_paper_execution.py"
+      ],
+      "honest_notes": "P0/P4 已完整验证 tick/step/minNotional 过滤器、SUI/USDT/BNB 三种扣费碎股向下取整、买前可保护性拦截与余额不足自动缩减/拒单。"
+    },
+    "QA-04": {
+      "qa_id": "QA-04",
+      "title": "限价单永不成交、部分成交、撤单改单与买单超时 ORDER_UNKNOWN 幂等对账",
+      "responsible_phases": [
+        "P0",
+        "P4"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "FI-P4-02_never_filled_ttl_cancel": "PASS",
+        "FI-P4-03_partial_fill_40pct_protected": "PASS",
+        "FI-P4-04_micro_partial_fill_entry_frozen": "PASS",
+        "FI-P4-05_order_unknown_reconciliation": "PASS"
+      },
+      "evidence_files": [
+        "evidence/p4_paper_execution_audit_evidence.json",
+        "tests/test_p4_b01_d01_r01_paper_execution.py"
+      ],
+      "honest_notes": "FI-P4-02 ~ FI-P4-05 100% 通过：部分成交立即为已成交份额挂 -1% 保护单，微额不可保护持仓立即冻结新开仓，ORDER_UNKNOWN 状态必先按 clientOrderId 查单对账。"
+    },
+    "QA-05": {
+      "qa_id": "QA-05",
+      "title": "买单成交瞬间进程/服务器崩溃，重启进入 BOOT -> SYNCING 优先恢复止损保护",
+      "responsible_phases": [
+        "P0",
+        "P1",
+        "P4"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "FI-P4-06_crash_after_fill_recovery": "PASS",
+        "INV-R7_open_position_mandatory_stop_protection": true
+      },
+      "evidence_files": [
+        "evidence/p4_paper_execution_audit_evidence.json",
+        "tests/test_p4_b01_d01_r01_paper_execution.py"
+      ],
+      "honest_notes": "买单 FILLED 瞬间模拟崩溃重启后，D-01 从 BOOT -> SYNCING 检测裸仓并优先进入 PROTECTION_PENDING -> PROTECTED 补齐 -1% 止损保护卖单。"
+    },
+    "QA-06": {
+      "qa_id": "QA-06",
+      "title": "止盈/止损组合订单数量锁定，零重复占用（零超锁）与零裸仓",
+      "responsible_phases": [
+        "P0",
+        "P5"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "over_reservation_violations": 0,
+        "naked_position_incidents": 0,
+        "unprotectable_tranche_deadlocks": 0,
+        "min_notional_degradation_modes": {
+          "50.0_SUI_100_USDT": "FULL_3_TRANCHE_40_30_30",
+          "6.0_SUI_12_USDT": "DEGRADED_2_TRANCHE_50_50",
+          "3.0_SUI_6_USDT": "DEGRADED_1_TRANCHE_100_C1_FALLBACK"
+        }
+      },
+      "evidence_files": [
+        "evidence/p5_c01_exit_comparison_evidence.json",
+        "tests/test_p5_c01_exit_and_backtest.py"
+      ],
+      "honest_notes": "OcoProtectionCoordinator 严格保证 reserved_qty == locked_sui <= sellable_qty <= actual_qty，分批止盈先撤旧保护单再重锁余量，超锁与裸仓次数恒等于 0。"
+    },
+    "QA-07": {
+      "qa_id": "QA-07",
+      "title": "快速跳价、-1% 触发后实际亏损超过 1%、压力滑点与触发保护单被拒应急平仓",
+      "responsible_phases": [
+        "P0",
+        "P5"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "gap_down_beyond_1pct_recorded": true,
+        "stop_rejection_emergency_sweep": true,
+        "pessimistic_same_bar_stop_precedence": true
+      },
+      "evidence_files": [
+        "evidence/p5_c01_exit_comparison_evidence.json",
+        "tests/test_p5_c01_exit_and_backtest.py"
+      ],
+      "honest_notes": "注入 -3.5% 闪崩跳空与保护单拒单故障，系统立即撤除未成交穿透限价单并执行含滑点应急平仓，如实记录 -3.84% 净亏损（证明 -1% 为触发线而非绝对亏损上限），零裸仓遗留。"
+    },
+    "QA-08": {
+      "qa_id": "QA-08",
+      "title": "24h 滚动亏损熔断（1%）、单笔风险（0.25%）、仓位上限（10%）与权限被放宽时强制拒绝",
+      "responsible_phases": [
+        "P0",
+        "P1",
+        "P4"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "INV-R2_suiusdt_symbol_uniqueness": true,
+        "INV-R4_single_trade_025pct_and_10pct_cap": true,
+        "INV-R5_rolling_24h_1pct_loss_breaker": true
+      },
+      "evidence_files": [
+        "evidence/p4_paper_execution_audit_evidence.json",
+        "tests/test_p0_contracts_and_gates.py",
+        "tests/test_p4_b01_d01_r01_paper_execution.py"
+      ],
+      "honest_notes": "RiskConfig 冻结不可放宽硬上限；R-01 独立风控在 24h 滚动亏损达 1.0% 时立即触发 ENTRY_FROZEN，且 100% 拦截任何非 SUIUSDT 或超限额订单。"
+    },
+    "QA-09": {
+      "qa_id": "QA-09",
+      "title": "systemd 崩溃/卡死/重启/断网/磁盘满/时钟偏移恢复与日本服务器连续 72h 真实运行 (FI-10B)",
+      "responsible_phases": [
+        "P1",
+        "P8"
+      ],
+      "status": "PARTIAL_PASS_PENDING",
+      "engineering_verified": true,
+      "statistical_or_external_status": "FI_10B_PENDING (1.07h / 72.0h)",
+      "key_metrics": {
+        "FI-01_to_FI-09_and_FI-10A_accelerated": "PASS",
+        "FI-10B_verification_status": "PENDING",
+        "FI-10B_real_elapsed_hours": 1.0684,
+        "FI-10B_required_wallclock_hours": 72.0,
+        "FI-10B_kernel_oom_kills": 0
+      },
+      "evidence_files": [
+        "evidence/real_72h_status_snapshot.json",
+        "tests/test_p1_fault_injection_matrix.py"
+      ],
+      "honest_notes": "FI-01~FI-09 及 FI-10A（72h 加速模拟）已全部 PASS；日本东京生产服务器真实连续 72 小时墙钟观测 FI-10B 当前已运行 1.07 小时（目标 72.0 小时，OOM=0），未满 72.0 真实小时前严格保持 PENDING。"
+    },
+    "QA-10": {
+      "qa_id": "QA-10",
+      "title": "SSH 异常登录、文件篡改、密钥脱敏、跨机器断联探测与外部独立公有云心跳",
+      "responsible_phases": [
+        "P0",
+        "P1"
+      ],
+      "status": "PARTIAL_PASS_PENDING",
+      "engineering_verified": true,
+      "statistical_or_external_status": "PUBLIC_CLOUD_CLOUDFLARE_FCM_CREDENTIALS_PENDING",
+      "key_metrics": {
+        "local_s01_file_tamper_and_ssh_lockdown": "PASS",
+        "cross_machine_dead_mans_switch_probe": "PASS",
+        "log_and_payload_redaction_rate": "100%",
+        "public_cloudflare_worker_production_credentials": "PENDING"
+      },
+      "evidence_files": [
+        "evidence/external_alert_receipts.jsonl",
+        "tests/test_p1_fault_injection_matrix.py"
+      ],
+      "honest_notes": "本机 S-01 入侵锁仓、日志 100% 脱敏及跨机器黑盒失联告警回执已实测 PASS；第三方公有云 Cloudflare Workers 生产账号与真实 FCM 云凭据未录入，诚实保持 PENDING。"
+    },
+    "QA-11": {
+      "qa_id": "QA-11",
+      "title": "Android 前后台分级通知、权限被拒、FCM 丢包/断网 WorkManager 告警补偿与防重放紧急锁仓",
+      "responsible_phases": [
+        "P7"
+      ],
+      "status": "PARTIAL_PASS_PENDING",
+      "engineering_verified": true,
+      "statistical_or_external_status": "PROTOCOL_AND_SIMULATOR_PASS__REAL_FIREBASE_CLOUD_CREDENTIALS_PENDING",
+      "key_metrics": {
+        "missed_high_critical_alert_loss_rate_pct": 0.0,
+        "replay_attack_commands_passed_count": 0,
+        "forbidden_mobile_actions_passed_count": 0,
+        "in_flight_sell_protection_preserved": true,
+        "gateway_p99_latency_ms": 0.3972
+      },
+      "evidence_files": [
+        "evidence/p7_g01_g02_mobile_alert_evidence.json",
+        "tests/test_p7_g01_mobile_gateway_and_g02_alerts.py"
+      ],
+      "honest_notes": "G-01/G-02 前台模态弹窗、后台高优通知、权限被拒置顶警告、FCM 100% 丢包与断网重连增量补偿（漏报率 0%）、Ed25519 防重放紧急锁仓保留 -1% 止损单及拦截 11/11 越权动作已全部验证 PASS；真实 Firebase 生产凭据真机公网推送回执保持 PENDING。"
+    },
+    "QA-12": {
+      "qa_id": "QA-12",
+      "title": "E-01 签名模型上架、SHADOW -> PAPER 原子切换、异常自动回滚与在途持仓退出版本锁定",
+      "responsible_phases": [
+        "P0",
+        "P6"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "VERIFIED_IN_PAPER",
+      "key_metrics": {
+        "six_layer_manifest_gate": "PASS",
+        "shadow_orders_submitted_count": 0,
+        "atomic_promotion_latency_ms": 0.3066,
+        "atomic_auto_rollback_latency_ms": 0.0824,
+        "in_flight_version_crosstalk_violations": 0
+      },
+      "evidence_files": [
+        "evidence/p6_e01_integration_and_rollback_evidence.json",
+        "tests/test_p6_e01_registry_and_integrated_pipeline.py"
+      ],
+      "honest_notes": "Ed25519+SHA256+Schema+Risk+Calibration 六层门禁、SHADOW 零下单隔离、亚毫秒级原子晋升与自动回滚、以及在途持仓退出策略版本锁定（串扰次数=0）已全部验证 PASS。"
+    },
+    "QA-13": {
+      "qa_id": "QA-13",
+      "title": "C1/C2/C3 三种退出策略严格同入场、同风控、同费用双层公平对照与样本外统计裁决",
+      "responsible_phases": [
+        "P3",
+        "P5"
+      ],
+      "status": "NO_EDGE",
+      "engineering_verified": true,
+      "statistical_or_external_status": "STATISTICAL_VERDICT_NO_EDGE",
+      "key_metrics": {
+        "identical_entries_risk_and_fees_verified": true,
+        "p3_oos_mean_realized_net_return": "-0.007098",
+        "p5_layer1_c1_mean_net_return_bps": "-71.89",
+        "p5_layer1_c2_mean_net_return_bps": "-57.35",
+        "p5_layer1_c3_mean_net_return_bps": "-51.88",
+        "recommended_baseline_per_occams_razor": "C1"
+      },
+      "evidence_files": [
+        "evidence/p3_real_historical_audit_evidence.json",
+        "evidence/p5_c01_exit_comparison_evidence.json",
+        "docs/P3_MATH_AUDIT_REPORT.md"
+      ],
+      "honest_notes": "双层公平回测工程机制（同入场、同风控、同费率、零时间穿越、单次扣费）100% 验证通过；但 60 天币安现货真实历史数据独立测试集 FINAL_TEST (115 笔) 净期望为负（C1=-71.89bps, C2=-57.35bps, C3=-51.88bps），统计裁决严格为 NO_EDGE，按奥卡姆剃刀锁定最简 C1 基线并严禁实盘。"
+    },
+    "QA-14": {
+      "qa_id": "QA-14",
+      "title": "LIVE 默认物理关闭；无 7 项 GO/NO-GO 全通与投资人 Ed25519 签名令牌绝不可绕过",
+      "responsible_phases": [
+        "P0",
+        "P4",
+        "P8"
+      ],
+      "status": "PASS",
+      "engineering_verified": true,
+      "statistical_or_external_status": "NON_BYPASSABLE_GATE_ACTIVE",
+      "key_metrics": {
+        "default_execution_mode": "PAPER",
+        "immutable_approver_pubkey_default": null,
+        "persistent_sqlite_wal_nonce_anti_replay": true,
+        "runtime_code_tree_sha256_binding": true,
+        "untrusted_config_and_env_override_blocked": true
+      },
+      "evidence_files": [
+        "src/sui_quant/config.py",
+        "tests/test_p0_contracts_and_gates.py",
+        "tests/test_p8_final_audit_and_go_no_go_gate.py"
+      ],
+      "honest_notes": "默认模式严格锁定 PAPER；IMMUTABLE_APPROVER_ED25519_PUBKEY_HEX 默认为 None；PersistentNonceRegistry 磁盘持久化防重放与运行时代码树 SHA-256 绑定 100% 阻断任何未授权 LIVE 激活。"
+    }
+  },
+  "soak_rehearsal_report": {
+    "total_bars_rehearsed": 31,
+    "duplicate_and_out_of_order_events_rejected": 2,
+    "unclosed_kline_bars_isolated": 1,
+    "entries_opened_count": 2,
+    "partial_fill_immediately_protected_verified": true,
+    "in_flight_model_hot_swap_and_version_pin_verified": true,
+    "auto_rollback_on_faulty_model_verified": true,
+    "auto_rollback_latency_ms": 0.0706,
+    "c01_exits_completed_count": 1,
+    "over_reservation_violations": 0,
+    "naked_position_incidents": 0,
+    "version_crosstalk_violations": 0,
+    "mobile_fcm_drop_offline_sync_zero_loss_verified": true,
+    "mobile_signed_freeze_preserved_stop_orders_verified": true,
+    "mobile_forbidden_actions_blocked_count": 4,
+    "crash_and_boot_syncing_reconciliation_verified": true,
+    "live_orders_sent_count": 0,
+    "cycle_p50_ms": 4.2943,
+    "cycle_p95_ms": 7.8096,
+    "cycle_p99_ms": 7.8096,
+    "memory_delta_mib": 0.2138,
+    "memory_peak_mib": 0.2161
+  },
+  "live_authorization_draft": {
+    "document_type": "SUI_QUANT_V1_LIVE_AUTHORIZATION_MANIFEST_DRAFT",
+    "manifest_approval_state": "UNSIGNED_DRAFT_DO_NOT_SIGN_WHILE_NO_EDGE",
+    "warning_banner": "DO NOT SIGN OR ACTIVATE: Out-of-sample historical statistical verdict is 'NO_EDGE' and 72h real server wall-clock soak (FI-10B) is 'PENDING'. System must remain strictly in PAPER mode.",
+    "immutable_approver_pubkey_pinned_in_code": null,
+    "required_scope_constraints": {
+      "authorized_symbol": "SUIUSDT",
+      "reference_symbol_read_only": "BTCUSDT",
+      "spot_only": true,
+      "allow_short": false,
+      "allow_leverage": false,
+      "allow_margin_or_loan": false,
+      "allow_averaging_down": false
+    },
+    "candidate_risk_ceilings": {
+      "stop_loss_trigger_pct": "0.01",
+      "max_single_trade_risk_pct": "0.0025",
+      "max_capital_allocation_pct": "0.10",
+      "max_rolling_24h_loss_pct": "0.01",
+      "c1_net_profit_target_pct": "0.015",
+      "max_authorization_ttl_days": 7
+    },
+    "cryptographic_binding_fields": {
+      "nonce_id_placeholder": "<TO_BE_ASSIGNED_AT_SIGNING_TIME_MIN_8_CHARS>",
+      "approver_id": "<INVESTOR_ID>",
+      "max_capital_usdt": "<INVESTOR_APPROVED_MAX_USDT>",
+      "risk_config_version": "1.0.0-candidate",
+      "risk_config_sha256": "06f3a48b8405cdc5e3d61757aac28cbaf9d97ca2d982341e43747f667a34a044",
+      "runtime_code_tree_sha256": "13f83444826f32060e31d6f2d88a0840d555c804de856d7a5090776160cdb1c4",
+      "issued_at_utc": "<ISO8601_UTC>",
+      "expires_at_utc": "<ISO8601_UTC_MAX_7_DAYS>",
+      "ed25519_sig_hex_placeholder": ""
+    }
+  }
+}

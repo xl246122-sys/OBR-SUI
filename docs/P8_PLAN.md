@@ -1,8 +1,8 @@
 # P8-PLAN｜QA-01～QA-14 全量验收总审计、长期 PAPER 试运行核验与实盘 GO/NO-GO 授权闸门（严格锁定 PAPER / NO-GO FOR LIVE）
 
-> **阶段编号**：P8｜**当前状态**：`READY_FOR_REVIEW`（仅提交正式实施计划，等待审查批准；**未获授权前绝不执行 P8 代码修改，严禁开启 LIVE 实盘**）  
-> **前置已完成**：`MASTER-PLAN`、`P0`、`P1`、`P2`、`P3`（数学框架补证完毕，历史统计裁决 `NO_EDGE`）、`P4`（`B-01/D-01/R-01` 模拟执行闭环）、`P5`（`C-01` 三策略退出与双层公平回测）、`P6`（`D-01/E-01` 全链路整合、签名模型热切换与回滚）、`P7`（`G-01/G-02` 原生 Android 监控、前后台告警与受控紧急锁仓 API，全库 `75 passed`）。  
-> **执行模式硬边界**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`，**因 P3/P5 真实历史样本外统计裁决为 `NO_EDGE` 且 `FI-10B` 72h 真实墙钟观测未满额，P8 实盘准入裁决必须诚实锁定为 `NO-GO FOR LIVE`（真实资金订单数恒等于 `0`）**。
+> **阶段编号**：P8｜**当前状态**：`IMPLEMENTED_AND_VERIFIED`（P8 全量总审计、全栈多故障 `PAPER` 联合演练与实盘 `GO/NO-GO` 门禁核验已完成；全库 `78 passed`；**实盘准入裁决严格锁定 `NO_GO_STAY_IN_PAPER`，真实资金订单数恒等于 `0`**）  
+> **前置已完成**：`MASTER-PLAN`、`P0`、`P1`、`P2`、`P3`（数学框架补证完毕，历史统计裁决 `NO_EDGE`）、`P4`（`B-01/D-01/R-01` 模拟执行闭环）、`P5`（`C-01` 三策略退出与双层公平回测）、`P6`（`D-01/E-01` 全链路整合、签名模型热切换与回滚）、`P7`（`G-01/G-02` 原生 Android 监控、前后台告警与受控紧急锁仓 API）、`P8`（`QA-01~QA-14` 总审计与 `GO/NO-GO` 门禁核验，详见 [`docs/GO_NO_GO_AUDIT.md`](file:///D:/OBR-SUI/docs/GO_NO_GO_AUDIT.md) 与 [`evidence/p8_final_go_no_go_audit_evidence.json`](file:///D:/OBR-SUI/evidence/p8_final_go_no_go_audit_evidence.json)）。  
+> **执行模式硬边界**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`，**因 P3/P5 真实历史样本外统计裁决为 `NO_EDGE` 且 `FI-10B` 72h 真实墙钟观测未满额，P8 实盘准入裁决诚实锁定为 `NO_GO_STAY_IN_PAPER`（真实资金订单数恒等于 `0`）**。
 
 ---
 
@@ -133,5 +133,5 @@ flowchart TB
 
 ## 10 等待审查的问题与结论
 
-- **当前状态**：`READY_FOR_REVIEW`。
-- 请确认是否批准按本计划进入 **P8（QA-01～QA-14 全量验收总审计、长期 PAPER 试运行核验与实盘 GO/NO-GO 授权闸门）** 实施？
+- **当前状态**：`IMPLEMENTED_AND_VERIFIED`（全仓测试 `78 passed`）。
+- **最终发布裁决**：`NO_GO_STAY_IN_PAPER`（真实订单数 `= 0`，详见 [`docs/GO_NO_GO_AUDIT.md`](file:///D:/OBR-SUI/docs/GO_NO_GO_AUDIT.md) 与 [`evidence/p8_final_go_no_go_audit_evidence.json`](file:///D:/OBR-SUI/evidence/p8_final_go_no_go_audit_evidence.json)）。
