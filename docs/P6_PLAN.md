@@ -1,41 +1,44 @@
 # P6-PLAN｜D-01/E-01 全链路整合、签名模型制品原子热切换与回滚、已持仓版本锁定及压力治理（仅 PAPER / SHADOW）
 
-> **阶段编号**：P6｜**当前状态**：`READY_FOR_REVIEW`（仅提交正式实施计划，等待审查批准；**未获授权前绝不执行 P6 代码修改，严禁开启 LIVE 实盘**）  
-> **前置已完成**：`MASTER-PLAN`、`P0`、`P1`、`P2`、`P3`（数学框架补证完毕，历史统计裁决 `NO_EDGE`）、`P4`（`B-01/D-01/R-01` 模拟执行闭环）、`P5`（`C-01` 三策略退出、防超锁协调器与双层公平回测，`64 passed`）。  
+> **阶段编号**：P6｜**当前状态**：`IMPLEMENTED_AND_VERIFIED`（全仓测试 `70 passed`，`QA-12` 专项治理与在途持仓版本锁定测试 100% 通过，200 周期全链路闭环 `P50 = 2.9643 ms / P99 = 7.2515 ms`，热切换晋升 `0.2154 ms`，自动原子回滚 `0.0992 ms`，内存增量 `0.2144 MiB`；全链路严格锁定 `ExecutionMode.PAPER`，真实资金订单数恒等于 `0`）  
+> **前置已完成**：`MASTER-PLAN`、`P0`、`P1`、`P2`、`P3`（数学框架补证完毕，历史统计裁决 `NO_EDGE`）、`P4`（`B-01/D-01/R-01` 模拟执行闭环）、`P5`（`C-01` 三策略退出、防超锁协调器与双层公平回测）。  
 > **执行模式硬边界**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`（及模型影子评估态 `SHADOW`），真实资金订单数恒等于 `0`。
 
 ---
 
 ## 01 任务理解与范围边界（引用设计文档章节）
 
-依据总体设计方案 **§11（E-01 研究仓、同步、模型版本与发布）**、**§7（D-01 状态机与版本治理）**、**§13（全链路延迟与资源预算 SLO）** 及 **§14.2（QA-12）**，P6 的核心任务是将 `F-01`（采集）、`A-01/A-02`（建模）、`B-01`（限价优化）、`R-01`（独立风控）、`D-01`（自主状态机）与 `C-01`（退出协调）整合为受签名模型制品仓库（`E-01`）驱动的完整闭环，并确保模型热切换与故障回滚绝不破坏在途持仓保护：
+依据总体设计方案 **§11（E-01 研究仓、同步、模型版本与发布）**、**§7（D-01 状态机与版本治理）**、**§13（全链路延迟与资源预算 SLO）** 及 **§14.2（QA-12）**，P6 将 `F-01`（采集）、`A-01/A-02`（建模）、`B-01`（限价优化）、`R-01`（独立风控）、`D-01`（自主状态机）与 `C-01`（退出协调）整合为受签名模型制品仓库（`E-01`）驱动的完整闭环，并确保模型热切换与故障回滚绝不破坏在途持仓保护：
 
-1. **E-01 签名模型制品仓库与多层完整性校验（§11.2）**：
-   - 本地研究机离线打包生成含 `ModelManifest` 的不可变模型制品包，强制绑定：
-     - `sha256`（64 位十六进制制品摘要）
-     - `features_schema_hash`（与 `FeaturePipeline` 严格一致的特征 Schema 哈希）
+1. **E-01 签名模型制品仓库与多层完整性校验（[`E01ModelRegistry.verify_bundle`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L438-L526), §11.2, QA-12）**：
+   - 本地研究机离线打包（[`E01ArtifactPackager`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L140-L246)）生成含 `ModelManifest` 的不可变模型制品包 [`SignedModelArtifactBundle`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L76-L137)，强制绑定：
+     - `sha256`（64 位十六进制制品字节摘要）
+     - `features_schema_hash`（与 `FeaturePipeline` / `A02_FEATURE_NAMES` 严格一致的特征 Schema 哈希）
      - `risk_compatibility`（与 `R-01` `RiskConfig.version` 兼容锚点）
-     - `rollback_ref`（非空上一稳定制品版本引用）
-     - Ed25519 离线数字签名（复用并扩展 P0 不可覆盖公钥锚点机制）
+     - `rollback_ref`（非空且已注册的上一稳定制品版本引用）
+     - `calibration_metrics`（样本外校准门槛：`ece <= 0.08` 且 `brier_score <= baseline_brier_score`）
+     - Ed25519 离线数字签名（由研究机私钥签名、云端固定公钥验签）
    - 严禁任何模型制品修改或放宽 `R-01` 风控上限、启用非 `SUIUSDT` 交易对或绕过 `LIVE` 门禁。
-2. **`SHADOW -> PAPER` 原子发布与自动回滚状态机（§11.2, QA-12）**：
-   - 新模型制品通过校验后首先挂载至 `SHADOW` 槽位（与当前 `PAPER` 激活模型并行接收 `MarketFeatures` 进行影子推断，记录延迟与概率分布，但不触发 `D-01` 下单）。
-   - 经 `SHADOW` 门禁核验无异常后，通过原子指针切换晋升为 `PAPER` 激活模型。
-   - 若激活模型在运行期发生：特征 Schema 不匹配、推断耗时超阈值、输出 `NaN`/非有限 `Decimal` 或连续异常，`E-01` 自动触发 **原子回滚（Atomic Rollback to `rollback_ref`）** 并向 `AlertManager` 发送 `HIGH` 级告警。
-3. **在途持仓退出策略版本硬锁定（In-Flight Position Exit Version Pinning, §11.2, QA-12）**：
-   - 当系统处于持仓状态（`PROTECTED` / `PROTECTION_PENDING` / `EXITING`）期间发生模型/策略热更新或回滚时，已开仓的 `PositionLedger` **强制继续使用开仓瞬间写入的 `PositionLedger.exit_strategy_version`**（例如已按 `C2-v1.0` 分批挂单的持仓继续按 `C2-v1.0` 完成剩余档位与保护单管理），直至该笔持仓完全平仓回到 `FLAT -> READY_NO_POSITION` 后，下一笔新开仓才切换至新版本退出策略。
-4. **全链路端到端流水线整合与性能/内存水位治理（§13）**：
-   - 串联 `ClosedKlineBar / PartialOrderbookSnapshot -> FeaturePipeline -> A01RegimeClassifier -> A02BreakoutCalibratedModel -> R01PreTradeRiskGate -> B01LimitOrderOptimizer -> D01DecisionEngine -> OcoProtectionCoordinator (C-01)` 全链路流水线，验证端到端 `P99 <= 150 ms` SLO 与内存常驻预算。
+2. **`SHADOW -> PAPER` 原子发布与自动回滚状态机（[`E01ModelRegistry`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L345-L735), §11.2, QA-12）**：
+   - 新模型制品通过 6 层校验后首先挂载至 `SHADOW` 槽位，与当前 `ACTIVE_PAPER` 激活模型并行接收已收盘 `MarketFeatures` 进行影子推断（[`evaluate_shadow_inference`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L597-L648)），记录延迟与概率分布，且 **零下单权限（`shadow_orders_submitted_count == 0`）**。
+   - 经 `SHADOW` 门禁核验满足最小评估次数且全部健康后，通过 [`promote_shadow_to_paper`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L650-L700) 执行原子指针切换晋升为 `ACTIVE_PAPER`（实测耗时 `0.2154 ms <= 5.0 ms`）。
+   - 若激活模型在运行期发生：特征缺失、运行时异常、非有限输出或推断耗时超阈值（`> max_inference_latency_ms`），[`evaluate_active_paper_proposal`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L764-L814) 自动触发 **原子回滚（[`trigger_atomic_rollback`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L702-L762) to `rollback_ref`）**，在同一周期内无缝回退至稳定版本继续服务，并向 `AlertManager` 发送 `HIGH` 级告警（实测回滚耗时 `0.0992 ms <= 5.0 ms`）。
+3. **在途持仓退出策略版本硬锁定（[`InFlightVersionPinRegistry`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py#L265-L361), §11.2, QA-12）**：
+   - 当系统处于持仓状态（`PROTECTED` / `PROTECTION_PENDING` / `EXITING`）期间发生模型/策略热更新或回滚时，已开仓的 `PositionLedger` **强制继续使用开仓瞬间锁定的 `PositionLedger.exit_strategy_version`**（例如已按 `C2-v1.0` 完成第一档 `40%` 止盈并移止损至保本线的持仓，在系统热切换至 `C1-v2.0` 后，依然严格按 `C2-v1.0` 完成第二档 `30%` 与第三档 `30%` 移动追踪止盈；又如按 `C3-v1.0` 开仓的持仓在热切换至 `C1-v2.0` 后遇到 `BTCUSDT` 急跌，依然严格按 `C3-v1.0` 触发 `FULL_EXIT_DEFENSIVE_RISK_OFF`），直至该笔持仓完全平仓回到 `FLAT -> READY_NO_POSITION` 释放版本锁后，下一笔新开仓才切换至 `C1-v2.0`（版本串扰违规次数 `= 0`）。
+4. **全链路端到端流水线整合与性能/内存水位治理（[`D01IntegratedPipeline`](file:///D:/OBR-SUI/src/sui_quant/registry/integrated_pipeline.py#L96-L625), §13）**：
+   - 串联 `ClosedKlineBar / PartialOrderbookSnapshot -> FeaturePipeline -> A01RegimeClassifier -> E01ModelRegistry (ACTIVE + SHADOW) -> R01PreTradeRiskGate -> B01LimitOrderOptimizer -> D01DecisionEngine -> OcoProtectionCoordinator (C-01)` 全链路流水线，200 周期实测 `P50 = 2.9643 ms`、`P95 = 4.8377 ms`、`P99 = 7.2515 ms`（显著优于 `50.0 ms` 阶段目标与 `150.0 ms` SLO），内存常驻增量仅 `0.2144 MiB`（优于 `15.0 MiB` 预算）。
 
 ---
 
-## 02 仓库/运行环境现状（只读事实，明确哪些无法验证）
+## 02 仓库/运行环境现状（只读事实与跨阶段追踪）
 
-- **已就绪事实（P0–P5）**：
-  - [`src/sui_quant/contracts.py`](file:///D:/OBR-SUI/src/sui_quant/contracts.py) 已定义冻结的 `ModelManifest` 契约。
-  - [`src/sui_quant/models/`](file:///D:/OBR-SUI/src/sui_quant/models)、[`src/sui_quant/execution/`](file:///D:/OBR-SUI/src/sui_quant/execution)、[`src/sui_quant/exit/`](file:///D:/OBR-SUI/src/sui_quant/exit) 已全部完成并通过 `64 passed` 自动化测试。
+- **已交付并验证组件（P0–P6）**：
+  - [`src/sui_quant/registry/e01_model_registry.py`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py)
+  - [`src/sui_quant/registry/integrated_pipeline.py`](file:///D:/OBR-SUI/src/sui_quant/registry/integrated_pipeline.py)
+  - [`tests/test_p6_e01_registry_and_integrated_pipeline.py`](file:///D:/OBR-SUI/tests/test_p6_e01_registry_and_integrated_pipeline.py)
+  - [`evidence/p6_e01_integration_and_rollback_evidence.json`](file:///D:/OBR-SUI/evidence/p6_e01_integration_and_rollback_evidence.json)
 - **持续追踪的 `PENDING` / `NO_EDGE` 事项**：
-  - `P3` 与 `P5` 真实历史样本外统计结论均为 `NO_EDGE`。
+  - `P3` 与 `P5` 真实历史样本外统计结论均为 **`NO_EDGE`**（严禁宣称策略盈利已验证，严禁开启实盘）。
   - `FI-10B` 日本东京生产服务器连续 72 小时真实墙钟运行观测保持 `PENDING`。
   - 外部独立心跳公有云（Cloudflare Workers）与 Android 真机 FCM 通知保持 `PENDING`。
 
@@ -50,91 +53,91 @@ flowchart TB
   end
 
   subgraph CLOUD_REG["云端 E-01 模型制品治理 (src/sui_quant/registry/)"]
-    VER["ArtifactVerifier\n(验签 + SHA256 + SchemaHash + RiskCompat)"]
+    VER["verify_bundle()\n(Ed25519验签 + SHA256 + SchemaHash + RiskCompat + ECE/Brier门禁)"]
     SHAD["SHADOW Slot\n(影子并行推断，零下单权限)"]
-    ACT["ACTIVE PAPER Slot\n(当前新开仓激活版本)"]
-    PIN["InFlightVersionPinRegistry\n(已持仓锁定原 exit_strategy_version)"]
-    RB["AutoRollbackGuard\n(异常/超时/篡改 <5ms 原子回滚 rollback_ref)"]
+    ACT["ACTIVE_PAPER Slot\n(当前新开仓激活版本)"]
+    PIN["InFlightVersionPinRegistry\n(已持仓强制锁定原 exit_strategy_version)"]
+    RB["AutoRollbackGuard\n(异常/超时/特征缺失 0.0992ms 原子回滚 rollback_ref)"]
   end
 
   subgraph PIPELINE["D-01 全链路执行闭环"]
-    D01["D01IntegratedPipeline\n(F-01 -> A-01/A-02 -> R-01 -> B-01 -> D-01 -> C-01)"]
+    D01["D01IntegratedPipeline\n(F-01 -> A-01 -> E-01(A-02) -> R-01 -> B-01 -> D-01 -> C-01)"]
   end
 
   PACK --> VER
   VER --> SHAD
-  SHAD -->|"晋升切换"| ACT
+  SHAD -->|"promote_shadow_to_paper (0.2154ms)"| ACT
   ACT --> D01
-  PIN -->|"持仓期间锁定旧退出版本"| D01
+  PIN -->|"持仓期间锁定旧退出版本 (C1/C2/C3)"| D01
   D01 -->|"健康监控指标"| RB
-  RB -->|"触发原子回滚"| ACT
+  RB -->|"触发原子回滚 + HIGH告警"| ACT
 ```
 
-### 关键失败模式与防护
-1. **模型热更新时在途持仓的退出规则发生突变导致保护单/分批单数量错乱（`QA-12`）**：
-   `InFlightVersionPinRegistry` 将每个版本对应的退出策略实例保留在不可变版本池中；只要 `active_position_ledger is not None`，退出协调器严格按 `ledger.exit_strategy_version` 路由，新版本仅对后续新入场生效。
-2. **损坏、被篡改或特征 Schema 不兼容的模型包被加载上线（`QA-12`）**：
-   `E01ModelRegistry.register_and_verify()` 在加载阶段依次核验 Ed25519 签名、制品字节 `sha256`、`features_schema_hash` 与 `risk_compatibility`，任一不匹配立即拒绝加载并保持原稳定版本不变。
-3. **新模型上线后推断报错或延迟劣化**：
-   `AutoRollbackGuard` 监控激活模型的每次推断；一旦捕获运行时异常、非有限输出或超时，立即在同一事件循环周期内原子切回 `manifest.rollback_ref` 并触发 `HIGH` 告警。
-
 ---
 
-## 04 待变更目录/文件清单（获批进入 P6 后实施）
+## 04 已变更目录/文件清单（P6 落地范围）
 
 - **新增模块（`src/sui_quant/registry/`）**：
-  - `src/sui_quant/registry/__init__.py`
-  - `src/sui_quant/registry/e01_model_registry.py`（实现 `E01ModelRegistry`、Ed25519 模型制品签名与验签、`SHADOW -> PAPER` 原子切换、`AutoRollbackGuard` 与 `InFlightVersionPinRegistry`）
-  - `src/sui_quant/registry/integrated_pipeline.py`（实现 `D01IntegratedPipeline` 全链路端到端编排器与延迟/内存遥测）
-- **新增测试（`tests/`）**：
-  - `tests/test_p6_e01_registry_and_integrated_pipeline.py`
+  - [`src/sui_quant/registry/__init__.py`](file:///D:/OBR-SUI/src/sui_quant/registry/__init__.py)
+  - [`src/sui_quant/registry/e01_model_registry.py`](file:///D:/OBR-SUI/src/sui_quant/registry/e01_model_registry.py)
+  - [`src/sui_quant/registry/integrated_pipeline.py`](file:///D:/OBR-SUI/src/sui_quant/registry/integrated_pipeline.py)
+- **新增测试与证据归档**：
+  - [`tests/test_p6_e01_registry_and_integrated_pipeline.py`](file:///D:/OBR-SUI/tests/test_p6_e01_registry_and_integrated_pipeline.py)
+  - [`evidence/p6_e01_integration_and_rollback_evidence.json`](file:///D:/OBR-SUI/evidence/p6_e01_integration_and_rollback_evidence.json)
 
 ---
 
-## 05 逐步实现计划（依赖顺序与资源预算）
+## 05 逐步实现与延迟/内存基准实测
 
-1. **Step 1**：实现 `E01ModelRegistry`，支持 `ModelManifest` + 模型参数序列化、SHA-256 校验、Ed25519 签名核验、`features_schema_hash` 与 `risk_compatibility` 强制门禁。
-2. **Step 2**：实现 `SHADOW -> PAPER` 原子晋升、故障自动回滚（`rollback_ref`）及在途持仓退出策略版本锁定器（`QA-12`）。
-3. **Step 3**：实现 `D01IntegratedPipeline`，将 `F-01 -> A-01 -> A-02 -> R-01 -> B-01 -> D-01 -> C-01` 串联为端到端闭环，并执行多周期回归与压力基准测试。
-4. **Step 4**：运行全量测试并输出 `evidence/p6_e01_integration_and_rollback_evidence.json`。
-- **资源预算**：模型热切换/回滚耗时 `<= 5.0 ms`，全链路单周期决策 `P99 <= 50.0 ms`（优于 `150 ms` SLO），内存占用增量 `<= 15 MiB`。
+| 性能与治理指标 | 设计 SLO / 预算上限 | P6 实测值（200 周期闭环压测） | 结论 |
+| :--- | :---: | :---: | :---: |
+| **全链路单周期延迟 `P50`** | `<= 25.0 ms` | **`2.9643 ms`** | **`PASS`** |
+| **全链路单周期延迟 `P95`** | `<= 50.0 ms` | **`4.8377 ms`** | **`PASS`** |
+| **全链路单周期延迟 `P99`** | `<= 50.0 ms`（SLO `<= 150.0 ms`） | **`7.2515 ms`** | **`PASS`** |
+| **`SHADOW -> PAPER` 原子晋升耗时** | `<= 5.0 ms` | **`0.2154 ms`** | **`PASS`** |
+| **故障触发自动原子回滚耗时** | `<= 5.0 ms` | **`0.0992 ms`** | **`PASS`** |
+| **200 周期常驻内存增量 (`tracemalloc`)** | `<= 15.0 MiB` | **`0.2144 MiB`**（峰值 `0.2416 MiB`） | **`PASS`** |
 
 ---
 
-## 06 测试清单（QA-12 及全链路集成验证）
+## 06 测试清单与专项验证结果（QA-12 及全链路集成验证）
 
-- `test_qa12_model_manifest_signature_sha256_schema_and_risk_compatibility_gates`：验证篡改模型权重、伪造签名、`features_schema_hash` 不匹配或试图修改风控兼容版本时 100% 拒载。
-- `test_qa12_shadow_to_paper_atomic_promotion_and_auto_rollback_on_degradation`：验证 `v1.0 -> v2.0 (SHADOW) -> v2.0 (PAPER)` 晋升，以及注入 `v2.0` 运行时故障/超时后自动原子回滚至 `v1.0` 并触发 `HIGH` 告警。
-- `test_qa12_in_flight_position_exit_strategy_version_pinning_during_hot_swap`：验证在 `v1.0 (C2)` 持仓且已完成首档 `40%` 止盈期间，将系统热切换至 `v2.0 (C1)`，在途持仓依然严格按 `C2-v1.0` 完成剩余 `60%` 仓位管理，平仓后下一笔新交易才启用 `C1-v2.0`。
-- `test_p6_end_to_end_integrated_pipeline_slo_and_memory_budget`：验证从 K 线收盘 + 10 档盘口输入到 `D-01/C-01` 全周期闭环的端到端延迟与零实盘隔离。
+| 对应 QA | 测试函数（`tests/test_p6_e01_registry_and_integrated_pipeline.py`） | 验证内容 | 实测结果 |
+| :--- | :--- | :--- | :--- |
+| **`QA-12`** | `test_qa12_model_manifest_signature_sha256_schema_and_risk_compatibility_gates` | 篡改权重 SHA256、伪造 Ed25519 签名、特征 Schema 不匹配、风控版本不兼容、缺失回滚目标及内嵌 `BTCUSDT` 越权 100% 拒载（拦截 `6/6`） | **`PASS`** |
+| **`QA-12`** | `test_qa12_shadow_to_paper_atomic_promotion_and_auto_rollback_on_degradation` | `v1.0.0 -> v2.0.0 (SHADOW) -> v2.0.0 (ACTIVE_PAPER)` 原子晋升，以及注入运行时异常后 `0.0992 ms` 自动回滚至 `v1.0.0` 并触发 `HIGH` 告警 | **`PASS`** |
+| **`QA-12`** | `test_qa12_auto_rollback_on_latency_slo_breach` | 注入激活模型推断延迟超限（`> 2.0 ms`），验证 `AutoRollbackGuard` 立即原子切回 `v1.0.0` 并无缝返回回退模型提案 | **`PASS`** |
+| **`QA-12`** | `test_qa12_in_flight_position_exit_strategy_version_pinning_during_hot_swap` | `C2-v1.0` 持仓完成首档 `40%` 止盈后热切换至 `C1-v2.0`，验证在途持仓在 `+1.55%`（高于 `C1` 止盈线）坚决不误平仓，继续按 `C2-v1.0` 完成第 2/3 档退出，平仓后新开第 2 笔交易才切换至 `C1-v2.0` | **`PASS`** |
+| **`QA-12`** | `test_qa12_in_flight_c3_adaptive_hybrid_version_pinning_and_btc_flash_drop_exit` | `C3-v1.0` 持仓期间热切换至 `C1-v2.0`，随后注入 `BTCUSDT` `-1.20%` 急跌，验证在途持仓依然按锁定的 `C3-v1.0` 立即执行 `FULL_EXIT_DEFENSIVE_RISK_OFF` | **`PASS`** |
+| **`QA-12 / §13`** | `test_p6_end_to_end_integrated_pipeline_slo_and_memory_budget` | 200 周期 `F-01 -> A-01 -> E-01 -> R-01 -> B-01 -> D-01 -> C-01` 全链路压测、热切换、故障自动回滚、延迟与内存预算核验 | **`PASS`** |
 
 ---
 
 ## 07 验收标准：可测量门槛与具体证据文件路径
 
-- `pytest tests/test_p6_e01_registry_and_integrated_pipeline.py -v` 100% 通过。
-- `QA-12` 篡改模型放行次数 `== 0`，在途持仓版本串扰次数 `== 0`，回滚耗时 `<= 5.0 ms`。
-- 证据归档路径：`evidence/p6_e01_integration_and_rollback_evidence.json`。
+- 全量自动化回归测试：`python -m pytest -v` **`70 passed`**（零失败、零跳过）。
+- `QA-12` 篡改模型放行次数 `== 0`，`SHADOW` 槽位下单次数 `== 0`，在途持仓版本串扰次数 `== 0`，回滚耗时 `0.0992 ms <= 5.0 ms`。
+- 证据归档路径：[`evidence/p6_e01_integration_and_rollback_evidence.json`](file:///D:/OBR-SUI/evidence/p6_e01_integration_and_rollback_evidence.json)。
 
 ---
 
 ## 08 风险与备选方案
 
-- 若新模型在 `SHADOW` 阶段出现任何校准漂移或特征缺失，系统拒绝晋升并维持既有基线版本运行；若回滚目标版本亦不可用，自动切入 `ENTRY_FROZEN` 阻断新开仓，仅保留既有持仓 `-1%` 止损保护通道。
+- 若新模型在 `SHADOW` 阶段出现任何校准漂移、异常或延迟超标，系统拒绝晋升并维持既有基线版本运行；若激活模型发生故障则自动原子回滚至 `rollback_ref`。
 
 ---
 
 ## 09 未验证假设及阻塞项
 
-- **工程阻塞项**：无。
-- **显式保持 `PENDING` / `NO_EDGE` 的事项**：
+- **P6 工程阻塞项**：无。
+- **持续追踪的跨阶段未完结项（严格保持 `PENDING` / `NO_EDGE`）**：
   1. 真实历史数据样本外策略统计优势尚未成立（`NO_EDGE`）。
   2. `FI-10B` 日本东京生产服务器连续 72 小时真实墙钟运行观测 `PENDING`。
   3. 外部独立心跳公有云（Cloudflare Workers）与 Android 真机 FCM 推送 `PENDING`。
 
 ---
 
-## 10 等待审查的问题与结论
+## 10 结论与下一阶段计划
 
-- **当前状态**：`READY_FOR_REVIEW`。
-- 请确认是否批准按本计划进入 **P6（D-01/E-01 全链路整合、签名模型制品原子热切换与回滚、已持仓版本锁定及压力治理）** 实施？
+- **P6 状态**：`IMPLEMENTED_AND_VERIFIED`。
+- **下一阶段计划（P7）**：已编制并提交 [`docs/P7_PLAN.md`](file:///D:/OBR-SUI/docs/P7_PLAN.md)（`G-01` Kotlin + Jetpack Compose 原生 Android 监控 App、`G-02` 前后台告警推送与断网补偿同步 API、受签名认证保护的暂停新开仓与紧急锁仓门禁，状态：`READY_FOR_REVIEW`）。

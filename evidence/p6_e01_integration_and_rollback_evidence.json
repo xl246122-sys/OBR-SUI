@@ -1,0 +1,42 @@
+{
+  "phase": "P6",
+  "status": "IMPLEMENTED_AND_VERIFIED",
+  "execution_mode_locked": "PAPER",
+  "live_orders_sent_count": 0,
+  "shadow_orders_submitted_count": 0,
+  "qa12_governance_and_rollback_audit": {
+    "tampered_sha256_rejected": true,
+    "forged_ed25519_signature_rejected": true,
+    "features_schema_mismatch_rejected": true,
+    "risk_compatibility_mismatch_rejected": true,
+    "symbol_and_live_gate_override_rejected": true,
+    "missing_rollback_target_rejected": true,
+    "shadow_to_paper_atomic_promotion_verified": true,
+    "auto_rollback_on_runtime_fault_verified": true,
+    "in_flight_position_exit_version_pinning_verified": true,
+    "in_flight_version_crosstalk_violations": 0,
+    "over_reservation_violations": 0,
+    "naked_position_violations": 0
+  },
+  "latency_and_memory_slo_benchmark_200_cycles": {
+    "cycles_evaluated": 200,
+    "entries_opened": 6,
+    "exits_completed": 6,
+    "cycle_p50_ms": 2.8642,
+    "cycle_p95_ms": 4.3336,
+    "cycle_p99_ms": 7.2646,
+    "cycle_slo_limit_ms": 150.0,
+    "cycle_p6_target_ms": 50.0,
+    "shadow_to_paper_promotion_latency_ms": 0.2096,
+    "atomic_auto_rollback_latency_ms": 0.0845,
+    "rollback_slo_limit_ms": 5.0,
+    "memory_delta_mib": 0.2156,
+    "memory_peak_traced_mib": 0.2432,
+    "memory_budget_limit_mib": 15.0
+  },
+  "cross_phase_pending_items": {
+    "p3_p5_real_historical_statistical_verdict": "NO_EDGE",
+    "fi_10b_japan_cloud_72h_real_wall_clock_soak": "PENDING",
+    "external_cloudflare_dms_and_fcm_real_push": "PENDING"
+  }
+}
