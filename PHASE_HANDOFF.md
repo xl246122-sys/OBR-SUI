@@ -2,8 +2,8 @@
 
 ## 1. 当前阶段元信息
 - **项目名称**：`SUI-Quant V1.0`
-- **已完成阶段**：`MASTER-PLAN` + `P0（环境只读核验、规范冻结与安全先决条件）`
-- **当前运行模式**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`（`LIVE` 默认禁用且受多重硬闸门拦截）
+- **已完成阶段**：`MASTER-PLAN` + `P0（含监理审查反馈全量整改：Ed25519签名门禁、防重放、买前可保护性及碎股边界、静态/动态过滤器隔离）`
+- **当前运行模式**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`（`LIVE` 默认禁用且受 Ed25519 非对称签名 + 7 项 GO/NO-GO + Nonce 防重放多重硬闸门拦截）
 - **真实订单产生数量**：`0`（NO）
 - **生产密钥/真实交易密钥数量**：`0`（NO）
 
@@ -35,7 +35,7 @@
 ```powershell
 python -m pytest -v
 ```
-- **测试结果**：`10 passed in 0.13s`（覆盖 `QA-03`, `QA-04`, `QA-05`, `QA-06`, `QA-07`, `QA-08`, `QA-10`, `QA-14` 核心契约与门禁）。
+- **测试结果**：`12 passed in 0.07s`（覆盖 `QA-03`, `QA-04`, `QA-05`, `QA-06`, `QA-07`, `QA-08`, `QA-10`, `QA-14` 及监理补充的 Task 1.1 ~ 1.6 全部边界用例，详见 [`docs/P0_REVIEW_REMEDIATION.md`](file:///D:/OBR-SUI/docs/P0_REVIEW_REMEDIATION.md)）。
 
 ---
 

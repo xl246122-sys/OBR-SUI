@@ -8,7 +8,9 @@ version = "1.0.0"
 description = "SUI-Quant V1.0 Mathematical Quantitative Trading System (Spot SUIUSDT Only, Default PAPER/RESEARCH)"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "cryptography>=42.0.0",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

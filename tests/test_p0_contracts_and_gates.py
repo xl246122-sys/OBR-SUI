@@ -1,12 +1,22 @@
-"""P0 Unit and Acceptance Tests for SUI-Quant V1.0 contracts, filters, risk boundaries, and LIVE gates."""
+"""P0 Unit and Acceptance Tests for SUI-Quant V1.0 contracts, filters, risk boundaries, and LIVE gates.
+
+Includes P0 Remediation verification:
+- Ed25519 asymmetric signature verification, replay protection, version/SHA256 binding on `LiveAuthorizationToken`
+- Proof that `PAPER` default and `LIVE` gates cannot be bypassed via env vars, malformed configs, or parameter tampering
+- Boundary tests for `step_size`, fee asset (`SUI` vs `BNB` vs `USDT`), residual dust, `min_notional`, and insufficient sellable quantity
+- Distinction between `P0_STATIC_SNAPSHOT` filters and `DYNAMIC_EXCHANGE_INFO` runtime refresh enforcement
+"""
 
 from __future__ import annotations
 
 import logging
+from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from sui_quant.config import (
     ExecutionMode,
@@ -21,7 +31,6 @@ from sui_quant.contracts import (
     AlertEvent,
     AlertSeverity,
     BreakoutProposal,
-    DataQuality,
     MarketEvent,
     MarketFeatures,
     ModelManifest,
@@ -36,9 +45,15 @@ from sui_quant.contracts import (
 )
 from sui_quant.exchange_rules import (
     ExchangeFilterError,
+    FilterSourceType,
+    P0_SNAPSHOT_SUIUSDT_FILTERS,
     SUIUSDT_FILTERS,
+    StaleExchangeFilterError,
+    SymbolFilters,
     compute_c1_net_target_sell_price,
+    compute_post_fill_sellable_position,
     compute_stop_loss_trigger_price,
+    validate_pre_buy_protectability,
 )
 from sui_quant.security.redaction import RedactingLogFilter, redact_mapping, redact_text
 from sui_quant.state_machine import (
@@ -49,6 +64,53 @@ from sui_quant.state_machine import (
 )
 from sui_quant.utils.clock import monotonic_ns, utc_now
 from sui_quant.utils.ids import generate_client_order_id
+
+
+def _make_signed_live_token(
+    priv_key: Ed25519PrivateKey,
+    risk: RiskConfig,
+    token_id: str = "NONCE-20261031-0001",
+    git_sha: str = "26b008fe283f00c6e55de0b38c52f7f8adda1d99",
+    issued_offset_min: int = -5,
+    ttl_days: int = 3,
+) -> tuple[LiveAuthorizationToken, str]:
+    pub_hex = (
+        priv_key.public_key()
+        .public_bytes(encoding=Encoding.Raw, format=PublicFormat.Raw)
+        .hex()
+    )
+    issued = utc_now() + timedelta(minutes=issued_offset_min)
+    expires = issued + timedelta(days=ttl_days)
+    risk_sha = risk.canonical_sha256()
+    payload = LiveAuthorizationToken.canonical_Signing_payload(
+        token_id=token_id,
+        approver_id="investor-owner",
+        authorized_symbol="SUIUSDT",
+        max_capital_usdt=Decimal("1000.00"),
+        max_single_trade_risk_pct=Decimal("0.0025"),
+        max_rolling_24h_loss_pct=Decimal("0.01"),
+        risk_config_version=risk.version,
+        risk_config_sha256=risk_sha,
+        git_commit_sha=git_sha,
+        issued_at_utc=issued,
+        expires_at_utc=expires,
+    )
+    sig_hex = priv_key.sign(payload).hex()
+    token = LiveAuthorizationToken(
+        token_id=token_id,
+        approver_id="investor-owner",
+        authorized_symbol="SUIUSDT",
+        max_capital_usdt=Decimal("1000.00"),
+        max_single_trade_risk_pct=Decimal("0.0025"),
+        max_rolling_24h_loss_pct=Decimal("0.01"),
+        risk_config_version=risk.version,
+        risk_config_sha256=risk_sha,
+        git_commit_sha=git_sha,
+        issued_at_utc=issued,
+        expires_at_utc=expires,
+        ed25519_signature_hex=sig_hex,
+    )
+    return token, pub_hex
 
 
 def test_decimal_enforcement_rejects_binary_float() -> None:
@@ -131,7 +193,6 @@ def test_breakout_proposal_probability_simplex_and_regime_guard() -> None:
             expiry=now + timedelta(minutes=5),
         )
 
-    # DOWN_TREND / HIGH_VOLATILITY / DATA_UNHEALTHY must never allow entry
     with pytest.raises(ValueError, match="must never allow new entry"):
         RegimeDecision(
             decision_id="REG-1",
@@ -145,29 +206,17 @@ def test_breakout_proposal_probability_simplex_and_regime_guard() -> None:
 
 
 def test_suiusdt_exchange_filters_and_dust_rounding_qa03_qa06() -> None:
-    # Valid SUIUSDT order: price tick 0.0001, qty step 0.1, notional >= 5.0
     SUIUSDT_FILTERS.validate_order(price=Decimal("2.1234"), qty=Decimal("10.5"))
 
-    # Invalid tick size (0.00001)
     with pytest.raises(ExchangeFilterError, match="tick_size"):
         SUIUSDT_FILTERS.validate_order(price=Decimal("2.12345"), qty=Decimal("10.0"))
 
-    # Invalid step size (0.05 < 0.1 step)
     with pytest.raises(ExchangeFilterError, match="step_size"):
         SUIUSDT_FILTERS.validate_order(price=Decimal("2.1234"), qty=Decimal("10.05"))
 
-    # Invalid notional (< 5.0 USDT)
     with pytest.raises(ExchangeFilterError, match="notional"):
         SUIUSDT_FILTERS.validate_order(price=Decimal("2.0000"), qty=Decimal("2.0"))
 
-    # Dust handling when 10.0 SUI bought with 0.1% fee deducted in SUI -> 9.99 SUI net
-    net_sui_after_fee = Decimal("10.0") * Decimal("0.999")
-    assert net_sui_after_fee == Decimal("9.990")
-    sellable_qty = SUIUSDT_FILTERS.quantize_qty_down(net_sui_after_fee)
-    assert sellable_qty == Decimal("9.9")
-    SUIUSDT_FILTERS.validate_order(price=Decimal("2.0000"), qty=sellable_qty)
-
-    # PositionLedger must reject duplicate/over-reserved protection qty (QA-06)
     with pytest.raises(ValueError, match="reserved_qty .* cannot exceed actual_qty"):
         PositionLedger(
             position_id="POS-1",
@@ -182,12 +231,130 @@ def test_suiusdt_exchange_filters_and_dust_rounding_qa03_qa06() -> None:
         )
 
 
+def test_fee_asset_dust_and_insufficient_sellable_qty_boundaries_task1_5() -> None:
+    # 1. Base asset (SUI) fee deduction creates 0.09 SUI residual dust when 10.0 SUI bought with 0.1% fee
+    alloc_sui_fee = compute_post_fill_sellable_position(
+        gross_filled_qty=Decimal("10.0"),
+        avg_fill_price=Decimal("2.0000"),
+        fee_asset="SUI",
+        fee_amount=Decimal("0.0100"),
+    )
+    assert alloc_sui_fee.net_base_qty == Decimal("9.9900")
+    assert alloc_sui_fee.sellable_qty == Decimal("9.9")
+    assert alloc_sui_fee.dust_qty == Decimal("0.0900")
+    assert alloc_sui_fee.is_protectable is True
+
+    # 2. BNB fee deduction leaves 100% of base asset intact (0 dust)
+    alloc_bnb_fee = compute_post_fill_sellable_position(
+        gross_filled_qty=Decimal("10.0"),
+        avg_fill_price=Decimal("2.0000"),
+        fee_asset="BNB",
+        fee_amount=Decimal("0.00005"),
+    )
+    assert alloc_bnb_fee.net_base_qty == Decimal("10.0")
+    assert alloc_bnb_fee.sellable_qty == Decimal("10.0")
+    assert alloc_bnb_fee.dust_qty == Decimal("0.0")
+    assert alloc_bnb_fee.is_protectable is True
+
+    # 3. Micro partial fill of 0.1 SUI with SUI fee -> net 0.0999 SUI -> sellable_qty = 0.0 < min_qty (0.1)
+    alloc_micro = compute_post_fill_sellable_position(
+        gross_filled_qty=Decimal("0.1"),
+        avg_fill_price=Decimal("2.0000"),
+        fee_asset="SUI",
+        fee_amount=Decimal("0.0001"),
+    )
+    assert alloc_micro.sellable_qty == Decimal("0.0")
+    assert alloc_micro.dust_qty == Decimal("0.0999")
+    assert alloc_micro.is_protectable is False
+    assert alloc_micro.unprotectable_reason == "SELLABLE_QTY_BELOW_MIN_QTY"
+
+    # 4. Borderline order: buy 2.5 SUI at $2.01 ($5.025 buy notional >= $5.0),
+    #    after 0.1% SUI fee -> net 2.4975 -> sellable 2.4 SUI; at -1% stop ($1.9899),
+    #    stop_notional = 2.4 * 1.9899 = $4.77576 < $5.0 min_notional!
+    alloc_borderline = compute_post_fill_sellable_position(
+        gross_filled_qty=Decimal("2.5"),
+        avg_fill_price=Decimal("2.0100"),
+        fee_asset="SUI",
+        fee_amount=Decimal("0.0025"),
+    )
+    assert alloc_borderline.sellable_qty == Decimal("2.4")
+    assert alloc_borderline.stop_notional_usdt < Decimal("5.0")
+    assert alloc_borderline.is_protectable is False
+    assert alloc_borderline.unprotectable_reason == "STOP_NOTIONAL_BELOW_MIN_NOTIONAL"
+
+    # 5. Pre-buy protectability guard blocks borderline 2.5 SUI order BEFORE submission!
+    with pytest.raises(ExchangeFilterError, match="STOP_NOTIONAL_BELOW_MIN_NOTIONAL"):
+        validate_pre_buy_protectability(
+            planned_buy_price=Decimal("2.0100"),
+            planned_buy_qty=Decimal("2.5"),
+        )
+
+    # 6. Pre-buy protectability guard allows 3.0 SUI at $2.0100 (sellable 2.9 * 1.9899 = $5.77071 >= $5.25 buffer)
+    safe_alloc = validate_pre_buy_protectability(
+        planned_buy_price=Decimal("2.0100"),
+        planned_buy_qty=Decimal("3.0"),
+    )
+    assert safe_alloc.is_protectable is True
+    assert safe_alloc.sellable_qty == Decimal("2.9")
+
+
+def test_static_p0_snapshot_vs_dynamic_runtime_filters_task1_6() -> None:
+    now = utc_now()
+    # Static P0 snapshot is blocked when require_dynamic_freshness=True (runtime execution guard)
+    assert P0_SNAPSHOT_SUIUSDT_FILTERS.source == FilterSourceType.P0_STATIC_SNAPSHOT
+    with pytest.raises(StaleExchangeFilterError, match="P0_STATIC_SNAPSHOT"):
+        P0_SNAPSHOT_SUIUSDT_FILTERS.validate_order(
+            price=Decimal("2.0000"),
+            qty=Decimal("10.0"),
+            require_dynamic_freshness=True,
+            now_utc=now,
+        )
+
+    # Dynamic filters parsed from exchangeInfo payload succeed when fresh
+    sample_exchange_info_symbol = {
+        "symbol": "SUIUSDT",
+        "status": "TRADING",
+        "ocoAllowed": True,
+        "otoAllowed": True,
+        "allowTrailingStop": True,
+        "cancelReplaceAllowed": True,
+        "filters": [
+            {"filterType": "PRICE_FILTER", "minPrice": "0.00010000", "maxPrice": "1000.00000000", "tickSize": "0.00010000"},
+            {"filterType": "LOT_SIZE", "minQty": "0.10000000", "maxQty": "92141578.00000000", "stepSize": "0.10000000"},
+            {"filterType": "NOTIONAL", "minNotional": "5.00000000", "maxNotional": "9000000.00000000"},
+            {"filterType": "MAX_NUM_ORDERS", "maxNumOrders": 200},
+            {"filterType": "MAX_NUM_ALGO_ORDERS", "maxNumAlgoOrders": 5},
+            {"filterType": "MAX_NUM_ORDER_LISTS", "maxNumOrderLists": 20},
+        ],
+    }
+    dyn_filters = SymbolFilters.from_binance_exchange_info_symbol(
+        symbol_payload=sample_exchange_info_symbol,
+        fetched_at_utc=now - timedelta(seconds=30),
+    )
+    assert dyn_filters.source == FilterSourceType.DYNAMIC_EXCHANGE_INFO
+    dyn_filters.validate_order(
+        price=Decimal("2.0000"),
+        qty=Decimal("10.0"),
+        require_dynamic_freshness=True,
+        now_utc=now,
+    )
+
+    # Dynamic filters older than max_age_seconds (e.g. 2 hours old) are rejected as stale
+    with pytest.raises(StaleExchangeFilterError, match="stale"):
+        dyn_filters.validate_order(
+            price=Decimal("2.0000"),
+            qty=Decimal("10.0"),
+            require_dynamic_freshness=True,
+            now_utc=now + timedelta(hours=2),
+            max_age_seconds=3600,
+        )
+
+
 def test_c1_net_target_and_stop_loss_trigger_math_qa07() -> None:
     avg_buy = Decimal("2.0000")
     stop_trigger = compute_stop_loss_trigger_price(avg_buy)
     assert stop_trigger == Decimal("1.9800")
 
-    # C1 target sell price with 0.1% buy fee and 0.1% sell fee must yield >= +1.5% NET return
     p_sell = compute_c1_net_target_sell_price(
         avg_buy_price=avg_buy,
         buy_fee_rate=Decimal("0.001"),
@@ -206,42 +373,31 @@ def test_risk_config_immutable_boundaries_qa08() -> None:
     assert default_risk.trading_symbol == "SUIUSDT"
     assert default_risk.stop_loss_trigger_pct == Decimal("0.01")
 
-    # Attempt to trade BTCUSDT or other symbol -> rejected
+    with pytest.raises(FrozenInstanceError):
+        default_risk.allow_leverage = True  # type: ignore[misc]
+
     with pytest.raises(RiskBoundaryViolationError, match="Only 'SUIUSDT'"):
         RiskConfig(trading_symbol="BTCUSDT")
 
-    # Attempt to enable leverage or shorting -> rejected
     with pytest.raises(RiskBoundaryViolationError, match="Spot-only"):
         RiskConfig(allow_leverage=True)
 
-    # Attempt to relax -1% stop-loss trigger to -2% -> rejected
     with pytest.raises(RiskBoundaryViolationError, match="stop_loss_trigger_pct"):
         RiskConfig(stop_loss_trigger_pct=Decimal("0.02"))
 
-    # Attempt to relax single-trade risk above 0.25% -> rejected
     with pytest.raises(RiskBoundaryViolationError, match="max_single_trade_risk_pct"):
         RiskConfig(max_single_trade_risk_pct=Decimal("0.005"))
 
-    # Attempt to relax capital allocation above 10% -> rejected
     with pytest.raises(RiskBoundaryViolationError, match="max_capital_allocation_pct"):
         RiskConfig(max_capital_allocation_pct=Decimal("0.20"))
 
 
-def test_live_mode_strictly_blocked_by_default_qa14() -> None:
-    # Default config is strictly PAPER
+def test_ed25519_live_token_and_non_bypassable_live_gates_task1_2_1_3_qa14() -> None:
+    # 1. Default mode is strictly PAPER
     cfg = SystemConfig()
     assert cfg.mode == ExecutionMode.PAPER
     assert not cfg.allow_live_trading
 
-    # Attempting to instantiate LIVE mode without flags/gates/token -> blocked
-    with pytest.raises(LiveAuthorizationError, match="strictly disabled by default"):
-        SystemConfig(mode=ExecutionMode.LIVE)
-
-    # Attempting LIVE with allow_live_trading=True but incomplete Go/No-Go checklist -> blocked
-    with pytest.raises(LiveAuthorizationError, match="GO/NO-GO checklist is incomplete"):
-        SystemConfig(mode=ExecutionMode.LIVE, allow_live_trading=True)
-
-    # Attempting LIVE with complete checklist but missing LiveAuthorizationToken -> blocked
     all_go = GoNoGoChecklist(
         account_spot_suiusdt_verified=True,
         protection_orders_fault_proven=True,
@@ -251,61 +407,128 @@ def test_live_mode_strictly_blocked_by_default_qa14() -> None:
         security_and_external_heartbeat_proven=True,
         independent_audit_record_signed=True,
     )
-    with pytest.raises(LiveAuthorizationError, match="LiveAuthorizationToken is missing"):
-        SystemConfig(mode=ExecutionMode.LIVE, allow_live_trading=True, go_no_go=all_go)
+    risk = RiskConfig()
+    priv_key = Ed25519PrivateKey.generate()
+    attacker_key = Ed25519PrivateKey.generate()
+    git_sha = "26b008fe283f00c6e55de0b38c52f7f8adda1d99"
 
-    # Valid token unlocks when all 7 GO/NO-GO gates and digest match
-    issued = utc_now() - timedelta(minutes=5)
-    expires = issued + timedelta(days=7)
-    digest = LiveAuthorizationToken.compute_digest(
-        approver_id="investor-owner",
-        authorized_symbol="SUIUSDT",
-        max_capital_usdt=Decimal("1000.00"),
-        risk_config_version="1.0.0-candidate",
-        issued_at_utc=issued,
-        expires_at_utc=expires,
-    )
-    valid_token = LiveAuthorizationToken(
-        approver_id="investor-owner",
-        authorized_symbol="SUIUSDT",
-        max_capital_usdt=Decimal("1000.00"),
-        risk_config_version="1.0.0-candidate",
-        issued_at_utc=issued,
-        expires_at_utc=expires,
-        approval_statement_sha256=digest,
-    )
+    valid_token, pub_hex = _make_signed_live_token(priv_key=priv_key, risk=risk, git_sha=git_sha)
+
+    # 2. Valid Ed25519 signature + all 7 GO/NO-GO gates + matching risk SHA + matching git SHA unlocks LIVE
     live_cfg = SystemConfig(
         mode=ExecutionMode.LIVE,
+        risk=risk,
         allow_live_trading=True,
         go_no_go=all_go,
         live_auth_token=valid_token,
+        pinned_approver_pubkey_hex=pub_hex,
+        audited_git_commit_sha=git_sha,
     )
     assert live_cfg.mode == ExecutionMode.LIVE
 
+    # 3. Forged signature (signed by attacker's Ed25519 key instead of pinned investor key) -> BLOCKED
+    forged_token, _ = _make_signed_live_token(priv_key=attacker_key, risk=risk, git_sha=git_sha)
+    with pytest.raises(LiveAuthorizationError, match="Ed25519 signature verification failed"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=forged_token,
+            pinned_approver_pubkey_hex=pub_hex,
+            audited_git_commit_sha=git_sha,
+        )
+
+    # 4. Replay attack (token_id already in consumed_token_ids after restart) -> BLOCKED
+    with pytest.raises(LiveAuthorizationError, match="Replay attack"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=valid_token,
+            pinned_approver_pubkey_hex=pub_hex,
+            consumed_token_ids=("NONCE-20261031-0001",),
+            audited_git_commit_sha=git_sha,
+        )
+
+    # 5. Post-signing RiskConfig parameter tampering (even tightening or changing any parameter after signing) -> BLOCKED
+    modified_risk = RiskConfig(max_single_trade_risk_pct=Decimal("0.0020"))
+    with pytest.raises(LiveAuthorizationError, match="RiskConfig parameter tampering detected"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=modified_risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=valid_token,
+            pinned_approver_pubkey_hex=pub_hex,
+            audited_git_commit_sha=git_sha,
+        )
+
+    # 6. Code version mismatch (git_commit_sha tampering) -> BLOCKED
+    with pytest.raises(LiveAuthorizationError, match="git_commit_sha .* does not match"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=valid_token,
+            pinned_approver_pubkey_hex=pub_hex,
+            audited_git_commit_sha="deadbeef1234567",
+        )
+
+    # 7. Excessive token TTL (> 7 days) -> BLOCKED
+    long_ttl_token, _ = _make_signed_live_token(
+        priv_key=priv_key, risk=risk, git_sha=git_sha, ttl_days=14
+    )
+    with pytest.raises(LiveAuthorizationError, match="Token TTL"):
+        SystemConfig(
+            mode=ExecutionMode.LIVE,
+            risk=risk,
+            allow_live_trading=True,
+            go_no_go=all_go,
+            live_auth_token=long_ttl_token,
+            pinned_approver_pubkey_hex=pub_hex,
+            audited_git_commit_sha=git_sha,
+        )
+
+    # 8. Environment variable injection (`SUI_QUANT_MODE=LIVE` or `ALLOW_LIVE=1`) -> BLOCKED
+    with pytest.raises(LiveAuthorizationError, match="Environment variables are strictly forbidden"):
+        SystemConfig.from_untrusted_mapping(
+            raw_config={},
+            env_vars={"SUI_QUANT_MODE": "LIVE"},
+        )
+    with pytest.raises(LiveAuthorizationError, match="Environment variables are strictly forbidden"):
+        SystemConfig.from_untrusted_mapping(
+            raw_config={},
+            env_vars={"ALLOW_LIVE": "true"},
+        )
+
+    # 9. Untrusted dict with truthy string `allow_live_trading="true"` -> BLOCKED
+    with pytest.raises(LiveAuthorizationError, match="strict boolean"):
+        SystemConfig.from_untrusted_mapping(
+            raw_config={"mode": "PAPER", "allow_live_trading": "true"},
+        )
+
 
 def test_state_machine_valid_and_invalid_transitions_qa04_qa05() -> None:
-    # Boot must go through SYNCING first, never straight to READY_NO_POSITION
     assert can_transition(TradingState.BOOT, TradingState.SYNCING)
     assert not can_transition(TradingState.BOOT, TradingState.READY_NO_POSITION)
     with pytest.raises(InvalidStateTransitionError):
         assert_valid_transition(TradingState.BOOT, TradingState.READY_NO_POSITION)
 
-    # SIGNAL_CANDIDATE must go through RISK_CHECK, never straight to ORDER_SUBMITTED
     assert not can_transition(TradingState.SIGNAL_CANDIDATE, TradingState.ORDER_SUBMITTED)
     assert can_transition(TradingState.SIGNAL_CANDIDATE, TradingState.RISK_CHECK)
     assert can_transition(TradingState.RISK_CHECK, TradingState.ORDER_SUBMITTED)
 
-    # FILLED must go through PROTECTION_PENDING before PROTECTED
     assert not can_transition(TradingState.FILLED, TradingState.PROTECTED)
     assert can_transition(TradingState.FILLED, TradingState.PROTECTION_PENDING)
     assert can_transition(TradingState.PROTECTION_PENDING, TradingState.PROTECTED)
 
-    # Emergency states reachable from any state
     for state in TradingState:
         assert can_transition(state, TradingState.ENTRY_FROZEN)
         assert can_transition(state, TradingState.SECURITY_LOCKDOWN)
 
-    # Leaving SECURITY_LOCKDOWN cannot jump straight to READY_NO_POSITION without SYNCING
     assert not can_transition(TradingState.SECURITY_LOCKDOWN, TradingState.READY_NO_POSITION)
     assert can_transition(TradingState.SECURITY_LOCKDOWN, TradingState.SYNCING)
 

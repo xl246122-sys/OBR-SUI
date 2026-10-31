@@ -26,7 +26,7 @@
 |---|---|---|---|---|
 | **TM-01** | 权限提升 / 远程入侵 | 自动化僵尸网络或 AI 渗透工具扫描爆破云主机 SSH（已在前期日志中实测观测到每分钟针对 `root`/`support` 的爆破） | `CRITICAL` | 已启用：`PermitRootLogin no`、`AllowUsers ubuntu`、`MaxAuthTries 3`、`UFW` 默认拒绝入站、`Fail2Ban` 激进模式动态封禁 + 内核 `sysctl` 加固；P1 增加 `S-01` 实时监控异常登录并联动 `SECURITY_LOCKDOWN`。 |
 | **TM-02** | 凭据泄漏（Git / 日志 / Prompt） | API Key、Secret、服务器密码被意外写入日志文件、异常堆栈、Prompt 或提交至 Git 仓库 | `CRITICAL` | P0 已落地：`.gitignore` 强制排除凭据文件；`sui_quant.security.redaction` 日志过滤器自动拦截并掩码所有 Key/Secret/Signature/Password；单元测试强制核验。 |
-| **TM-03** | 交易所 API Key 被盗用 | 云主机被入侵或凭据外泄，攻击者尝试提币或跨市场对敲 | `CRITICAL` | 密钥策略强制要求：**禁用提现权限（Enable Withdrawals = OFF）**、**仅开启现货权限**、**强制绑定日本云主机固定公网 IP（`43.163.192.120`）**、交易对白名单锁定 `SUIUSDT`。 |
+| **TM-03** | 交易所 API Key 被盗用 | 云主机被入侵或凭据外泄，攻击者尝试提币或跨市场对敲 | `CRITICAL` | 密钥策略强制要求：**禁用提现权限（Enable Withdrawals = OFF）**、**仅开启现货权限**、**强制绑定日本云主机固定公网 IP（`<JAPAN_CLOUD_IP_REDACTED>`）**、交易对白名单锁定 `SUIUSDT`。 |
 | **TM-04** | 默认或误触实盘（Accidental Live） | 开发测试、配置错误或环境变量污染导致在未获用户批准时发出真实资金订单 | `CRITICAL` | P0 已落地多重硬闸门：`ExecutionMode` 默认锁定为 `PAPER`/`RESEARCH`；切换 `LIVE` 必须同时通过：① 显式配置标志、② 经过 SHA-256 校验的用户授权凭证（含批准限额与有效期）、③ `GO_NO_GO` 门禁检查全绿。任何一项缺失立即抛出 `LiveAuthorizationError`。 |
 | **TM-05** | 策略/AI 模型越权改写风控 | 训练脚本或异常模型制品尝试修改止损比例（`-1%`）、扩大单笔仓位（`>10%`）或交易其他币种 | `CRITICAL` | P0 已落地：`RiskConfig` 在代码层内置不可放宽硬上限（Hard Ceiling）；任何超出候选上限的配置实例化即抛 `RiskBoundaryViolationError`；`D-01` 禁止模型直接调用下单接口。 |
 | **TM-06** | 买单成交但止损保护失败（裸仓风险） | 买单全部或部分成交后，网络超时、进程崩溃或余量不足（Dust）导致止损单未能成功挂出 | `CRITICAL` | 状态机强制经由 `PROTECTION_PENDING` 验证交易所确认后才可进入 `PROTECTED`；若超时或失败，立即转入 `ENTRY_FROZEN` 并触发 `PROTECTION_DEGRADED` 高优告警，同时执行受控降级退出。 |

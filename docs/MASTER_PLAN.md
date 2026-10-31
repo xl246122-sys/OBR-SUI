@@ -21,7 +21,7 @@
    - GPU：`NVIDIA GeForce RTX 5060`
    - 磁盘（`D:\`）：总容量 `931.51 GiB`，剩余可用 `620.37 GiB`
    - 软件栈：`Python 3.11.5`、`git 2.55.0.windows.3`
-2. **日本 Ubuntu 云服务器（`43.163.192.120`）**：
+2. **日本 Ubuntu 云服务器（`<JAPAN_CLOUD_IP_REDACTED>`）**：
    - OS：`Ubuntu 26.04.1 LTS (Linux 7.0.0-30-generic x86_64)`
    - CPU：`2 vCPU`（`Intel Xeon Platinum 8255C @ 2.50GHz`）
    - RAM：`1962 MiB`（当前可用约 `1451 MiB`），Swap `2047 MiB`
