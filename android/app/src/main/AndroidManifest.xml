@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.suiquant.monitor">
+
+    <!-- Network and background sync permissions (§12.1, QA-11) -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Android 13+ runtime notification permission self-checked on startup (QA-11) -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <application
+        android:allowBackup="false"
+        android:fullBackupContent="false"
+        android:label="SUI-Quant Monitor (PAPER)"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="false">
+
+        <!-- G-02 High-Priority FCM Push Receiver (§12.2, QA-11) -->
+        <service
+            android:name=".push.SuiQuantFcmService"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.google.firebase.MESSAGING_EVENT" />
+            </intent-filter>
+        </service>
+
+        <!-- Default high-priority notification channel metadata -->
+        <meta-data
+            android:name="com.google.firebase.messaging.default_notification_channel_id"
+            android:value="sui_quant_critical_alerts_v1" />
+
+    </application>
+</manifest>

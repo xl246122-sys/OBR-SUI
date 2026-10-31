@@ -1,39 +1,45 @@
 # P7-PLAN｜G-01 原生 Kotlin + Jetpack Compose Android 监控端、G-02 前后台双通道告警与受控紧急锁仓 API（仅 PAPER）
 
-> **阶段编号**：P7｜**当前状态**：`READY_FOR_REVIEW`（仅提交正式实施计划，等待审查批准；**未获授权前绝不执行 P7 代码修改，严禁开启 LIVE 实盘**）  
-> **前置已完成**：`MASTER-PLAN`、`P0`、`P1`、`P2`、`P3`（数学框架补证完毕，历史统计裁决 `NO_EDGE`）、`P4`（`B-01/D-01/R-01` 模拟执行闭环）、`P5`（`C-01` 三策略退出、防超锁协调器与双层公平回测）、`P6`（`D-01/E-01` 全链路整合、签名模型热切换与回滚、在途持仓版本锁定，`70 passed`）。  
-> **执行模式硬边界**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`，Android 端仅具有只读遥测查看与经签名认证的受控防御操作（暂停新开仓 `ENTRY_FROZEN` / 紧急安全锁仓 `SECURITY_LOCKDOWN` / 告警确认 ACK），**绝不存储交易所 API 私钥、绝不具备手工下单或放宽风控权限**。
+> **阶段编号**：P7｜**当前状态**：`IMPLEMENTED_AND_VERIFIED`（全仓测试 `75 passed`，`QA-11` 专项告警路由、离线增量补偿与 Ed25519 防重放紧急锁仓测试 100% 通过，`410` 次 API 调用实测 `P50 = 0.2815 ms / P95 = 0.3658 ms / P99 = 0.5348 ms`，内存增量 `0.0343 MiB`；全链路严格锁定 `ExecutionMode.PAPER`，真实资金订单数恒等于 `0`）  
+> **前置已完成**：`MASTER-PLAN`、`P0`、`P1`、`P2`、`P3`（数学框架补证完毕，历史统计裁决 `NO_EDGE`）、`P4`（`B-01/D-01/R-01` 模拟执行闭环）、`P5`（`C-01` 三策略退出、防超锁协调器与双层公平回测）、`P6`（`D-01/E-01` 全链路整合、签名模型热切换与回滚、在途持仓版本锁定）。  
+> **执行模式硬边界**：严格锁定 `ExecutionMode.PAPER` / `ExecutionMode.RESEARCH`，Android 端仅具有只读遥测查看与经签名认证的受控防御操作（暂停新开仓 `ENTRY_FROZEN` / 紧急安全锁仓 `SECURITY_LOCKDOWN` / 告警确认 `ACK_ALERT`），**绝不存储交易所 API 私钥、绝不具备手工下单或放宽风控权限**。
 
 ---
 
 ## 01 任务理解与范围边界（引用设计文档章节）
 
-依据总体设计方案 **§1（实际硬件与职责分工）**、**§12（G-01 / G-02 Android 原生 APP、监控与推送）** 及 **§14.2（QA-11）**，P7 的核心任务是构建云端 `G-01 / G-02` 监控与告警网关 API，以及对应的原生 `Kotlin + Jetpack Compose + MVVM + Room + WorkManager + Keystore + FCM` Android 客户端工程与协议契约：
+依据总体设计方案 **§1（实际硬件与职责分工）**、**§12（G-01 / G-02 Android 原生 APP、监控与推送）** 及 **§14.2（QA-11）**，P7 构建了云端 `G-01 / G-02` 监控与受控防御网关 API，以及对应的原生 `Kotlin + Jetpack Compose + MVVM + Room + WorkManager + Keystore + FCM` Android 客户端工程与协议闭环：
 
-1. **云端 `G-01 / G-02` 监控与受控防御网关（`src/sui_quant/api/`，§12.1, §12.2）**：
-   - **只读遥测与审计快照接口（`GET /api/v1/status/summary`、`GET /api/v1/positions/active`、`GET /api/v1/alerts/pending`、`GET /api/v1/daily-report`）**：
+1. **云端 `G-01 / G-02` 监控与受控防御网关（[`G01MobileGateway`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L317-L780), §12.1, §12.2）**：
+   - **只读遥测与审计快照接口（[`get_status_summary`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L417-L483)、[`get_active_position`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L485-L537)、[`sync_pending_alerts`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L539-L575)、[`get_daily_report`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L577-L664)）**：
      - 聚合输出当前运行模式（`PAPER`）、`D-01` 状态机状态、`A-01` 市场状态与置信度、`E-01` 激活/影子模型版本与在途持仓锁定退出策略版本（`C1/C2/C3`）、`R-01` 滚动 24h 损益与风控余量、`F-01/F-02` WebSocket 延迟与心跳水位、以及敏感信息 100% 脱敏后的审计摘要。
    - **G-02 前后台告警分级推送、断网重连增量补偿与 ACK 闭环（`QA-11`）**：
-     - `INFO` 事件归入每日聚合摘要（`NOT_REQUIRED` 实时推送）；`HIGH` 与 `CRITICAL` 事件立即通过 `FCM High-Priority Data+Notification` 通道触发推送（状态 `SENT_AWAITING_ACK`），并在服务端持久化未确认队列。
-     - 当手机断网、FCM 延迟/丢弃或通知权限受限时，Android 客户端通过 `WorkManager` / 重连增量拉取接口（`GET /api/v1/alerts/sync?since_seq=...`）补齐全部未确认 `HIGH / CRITICAL` 告警，并在展示后发送 `POST /api/v1/alerts/{alert_id}/ack` 完成 `DELIVERED` 闭环。
-   - **受硬件密钥/签名令牌与防重放 Nonce 保护的防御控制接口（`POST /api/v1/control/freeze-entry`、`POST /api/v1/control/security-lockdown`）**：
-     - 仅允许触发防御性降级（`READY_NO_POSITION -> ENTRY_FROZEN` 或任意状态 `-> SECURITY_LOCKDOWN`），保留在途持仓 `-1%` 止损保护卖单；**严禁通过移动端接口直接解除 `SECURITY_LOCKDOWN`、放宽 `R-01` 风控参数或开启 `LIVE` 实盘**。
+     - `INFO` 事件归入每日聚合摘要（`DeliveryStatus.NOT_REQUIRED`，不触发实时推送）；`HIGH` 与 `CRITICAL` 事件立即通过高优先级通道触发推送（状态 `SENT_AWAITING_ACK`），并在服务端持久化未确认队列。
+     - 当手机断网、FCM 延迟/丢弃或通知权限受限时，Android 客户端通过 `WorkManager` / 重连增量拉取接口（[`sync_pending_alerts`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L539-L575)）补齐全部未确认 `HIGH / CRITICAL` 告警，并在展示后发送经 Ed25519 签名的 `ACK_ALERT` 完成 `DELIVERED` 闭环（漏报率 `0.0%`）。
+   - **受硬件密钥/签名令牌与防重放 Nonce 保护的防御控制接口（[`execute_control_command`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py#L796-L906)）**：
+     - 仅允许触发防御性降级（`FREEZE_ENTRY -> ENTRY_FROZEN`、`SECURITY_LOCKDOWN -> SECURITY_LOCKDOWN`）及 `ACK_ALERT`，在撤除未成交挂买单的同时 **严格保留在途持仓 `-1%` 止损保护卖单**；
+     - **物理拦截一切试图通过移动端发起的越权操作**（`PLACE_ORDER`、`MANUAL_BUY`、`MANUAL_SELL`、`CANCEL_PROTECTION_ORDER`、`UNFREEZE`、`RESUME_TRADING`、`UNLOCK_SECURITY_LOCKDOWN`、`RELAX_RISK`、`ENABLE_LIVE`、`SWITCH_TO_LIVE`、`CHANGE_SYMBOL` `11/11` 全部拒止并触发 `HIGH` 安全告警）。
 2. **G-01 原生 Android 客户端架构（`android/`，§12.1, QA-11）**：
    - 采用纯原生 `Kotlin + Jetpack Compose + MVVM + Room + WorkManager + Android Keystore + FirebaseMessagingService`：
-     - **前台态（App in Foreground）**：收到或拉取到 `HIGH / CRITICAL` 告警时立即弹出高优原生模态告警弹窗（`AlertDialog` / 顶部横幅），展示故障原因、系统已自动采取的保护动作及确认按钮。
-     - **后台/锁屏态（App in Background）**：通过 `NotificationChannel (IMPORTANCE_HIGH)` 弹出系统级高优先级通知；同时自检 `POST_NOTIFICATIONS` 权限与省电白名单状态，若权限被拒则在 App 首页顶部固定显示高危横幅提醒（`QA-11`）。
+     - **前台态（`AppLifecycleState.FOREGROUND`）**：收到或拉取到 `HIGH / CRITICAL` 告警时立即弹出原生模态告警弹窗（`AlertDialog`），展示故障原因、系统已自动采取的保护动作及确认按钮。
+     - **后台/锁屏态（`AppLifecycleState.BACKGROUND`）**：通过 `NotificationChannel (IMPORTANCE_HIGH)` 弹出系统级高优先级通知；同时自检 `POST_NOTIFICATIONS` 权限，若权限被拒则在 App 首页顶部固定显示高危红色横幅提醒（`QA-11`）。
 
 ---
 
-## 02 仓库/运行环境现状（只读事实，明确哪些无法验证）
+## 02 仓库/运行环境现状（只读事实与跨阶段追踪）
 
-- **已就绪事实（P0–P6）**：
-  - [`src/sui_quant/daemon/alert_manager.py`](file:///D:/OBR-SUI/src/sui_quant/daemon/alert_manager.py) 已实现 `AlertManager`（含冷却期去重、`DeliveryStatus` 状态机、`acknowledge_alert` 与 `list_undelivered_alerts`）。
-  - [`src/sui_quant/registry/integrated_pipeline.py`](file:///D:/OBR-SUI/src/sui_quant/registry/integrated_pipeline.py) 已完成 `F-01 -> A-01 -> E-01 -> R-01 -> B-01 -> D-01 -> C-01` 全链路闭环。
+- **已交付并验证组件（P0–P7）**：
+  - [`src/sui_quant/api/g01_mobile_gateway.py`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py) & [`src/sui_quant/api/__init__.py`](file:///D:/OBR-SUI/src/sui_quant/api/__init__.py)
+  - [`android/app/build.gradle.kts`](file:///D:/OBR-SUI/android/app/build.gradle.kts) & [`android/app/src/main/AndroidManifest.xml`](file:///D:/OBR-SUI/android/app/src/main/AndroidManifest.xml)
+  - [`android/app/src/main/java/com/suiquant/monitor/data/AlertDatabase.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/data/AlertDatabase.kt)
+  - [`android/app/src/main/java/com/suiquant/monitor/push/SuiQuantFcmService.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/push/SuiQuantFcmService.kt) & [`AlertSyncWorker.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/push/AlertSyncWorker.kt)
+  - [`android/app/src/main/java/com/suiquant/monitor/ui/MonitorDashboardScreen.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/ui/MonitorDashboardScreen.kt)
+  - [`tests/test_p7_g01_mobile_gateway_and_g02_alerts.py`](file:///D:/OBR-SUI/tests/test_p7_g01_mobile_gateway_and_g02_alerts.py)
+  - [`evidence/p7_g01_g02_mobile_alert_evidence.json`](file:///D:/OBR-SUI/evidence/p7_g01_g02_mobile_alert_evidence.json)
 - **持续追踪的 `PENDING` / `NO_EDGE` 事项（绝不伪报已验证）**：
-  - `P3` 与 `P5` 真实历史样本外统计结论均为 `NO_EDGE`。
+  - `P3` 与 `P5` 真实历史样本外统计结论均为 **`NO_EDGE`**（严禁开启实盘）。
   - `FI-10B` 日本东京生产服务器连续 72 小时真实墙钟运行观测保持 `PENDING`。
-  - Google FCM 生产云项目服务账号凭据与物理 Android 真机实网推送回执在未注入真实 FCM 密钥前保持 `PENDING`（本地将完整实现服务端 API、模拟器/客户端状态机与离线断网补偿闭环测试）。
+  - Google FCM 生产云项目服务账号凭据与物理 Android 真机实网推送回执在未注入真实 FCM 密钥前保持 `PENDING`。
 
 ---
 
@@ -44,15 +50,15 @@ flowchart LR
   subgraph CLOUD["日本云端 (src/sui_quant/api/ & daemon/)"]
     PIPE["D01IntegratedPipeline\n+ E01ModelRegistry + R01"]
     AM["AlertManager (G-02)\n(SQLite WAL 未确认队列)"]
-    API["G01MonitorAndControlService\n(只读遥测 / 告警增量同步 / 签名紧急冻结)"]
+    API["G01MobileGateway\n(只读遥测 / 告警增量同步 / 签名紧急冻结)"]
   end
 
   subgraph ANDROID["Android 原生监控端 (android/)"]
-    FCM["SuiQuantFirebaseMessagingService\n(后台高优系统通知 Channel)"]
+    FCM["SuiQuantFcmService\n(后台高优系统通知 Channel)"]
     WM["AlertSyncWorker (WorkManager)\n(断网重连 / FCM丢失增量拉取补偿)"]
     ROOM[("Room Offline Cache\n(AlertEntity / StatusSnapshot)")]
-    VM["MonitorViewModel (MVVM)\n+ Keystore Ed25519 签名器"]
-    UI["Jetpack Compose Dashboard\n+ 前台模态弹窗 + 通知权限被拒横幅"]
+    VM["MobileKeystoreSigner\n(Ed25519 防重放签名器)"]
+    UI["MonitorDashboardScreen\n(Jetpack Compose + 前台模态弹窗 + 权限被拒横幅)"]
   end
 
   PIPE --> AM
@@ -61,65 +67,66 @@ flowchart LR
   API <-->|"HTTPS + Ed25519 Nonce Auth"| WM & VM
   FCM --> ROOM
   WM --> ROOM
-  ROOM --> VM
+  ROOM --> UI
   VM --> UI
 ```
 
-### 关键失败模式与防护（`QA-11`）
-1. **FCM 推送延迟、被系统省电策略丢弃或手机短暂断网**：
-   服务端 `AlertManager` 在收到客户端显式 `ACK` 前始终保持 `delivery_status != DELIVERED`；客户端在 App 唤醒、`WorkManager` 周期任务或网络恢复时调用增量同步接口拉取所有未确认告警，补充触发前台弹窗/系统通知并回传 `ACK`。
-2. **Android 系统通知权限（`POST_NOTIFICATIONS`）被用户关闭**：
-   客户端在启动及每次回到前台时检测 `areNotificationsEnabled()`；一旦发现被拒，立即在 Compose 主界面置顶锁定红色告警横幅并记录诊断状态。
-3. **重放攻击或未授权请求试图调用移动端控制接口**：
-   所有控制指令（`FREEZE_ENTRY`、`SECURITY_LOCKDOWN`、`ACK_ALERT`）必须附带由客户端 Keystore 私钥签名的 `MobileCommandEnvelope`（含 `command_id` 单调防重放 Nonce、UTC 时间戳与有效载荷 SHA-256），且服务端物理禁止任何“解冻/下单/改风控/开实盘”指令。
-
 ---
 
-## 04 待变更目录/文件清单（获批进入 P7 后实施）
+## 04 已变更目录/文件清单（P7 落地范围）
 
 - **新增云端监控与告警网关模块（`src/sui_quant/api/`）**：
-  - `src/sui_quant/api/__init__.py`
-  - `src/sui_quant/api/g01_mobile_gateway.py`（实现 `G01MobileGateway`、只读状态聚合、日报生成、`G-02` 断网增量告警补偿同步、防重放 Ed25519 移动端控制验签与客户端状态机模拟器）
+  - [`src/sui_quant/api/__init__.py`](file:///D:/OBR-SUI/src/sui_quant/api/__init__.py)
+  - [`src/sui_quant/api/g01_mobile_gateway.py`](file:///D:/OBR-SUI/src/sui_quant/api/g01_mobile_gateway.py)
+- **更新告警管理器同步回调状态守卫**：
+  - [`src/sui_quant/daemon/alert_manager.py`](file:///D:/OBR-SUI/src/sui_quant/daemon/alert_manager.py)（先写入 WAL 记录再触发 `push_sender`，避免同步客户端 ACK 将状态置为 `DELIVERED` 后被覆盖回 `SENT_AWAITING_ACK`）
 - **新增原生 Android 客户端工程源码（`android/`）**：
-  - `android/app/build.gradle.kts` & `android/app/src/main/AndroidManifest.xml`
-  - `android/app/src/main/java/com/suiquant/monitor/data/AlertDatabase.kt`（Room 本地持久化与增量同步 DAO）
-  - `android/app/src/main/java/com/suiquant/monitor/push/SuiQuantFcmService.kt` & `AlertSyncWorker.kt`（FCM 后台高优通知与 `WorkManager` 离线补偿）
-  - `android/app/src/main/java/com/suiquant/monitor/ui/MonitorDashboardScreen.kt`（Jetpack Compose 监控主页、前台模态告警弹窗、通知权限被拒置顶警告与受控紧急锁仓按钮）
-- **新增测试（`tests/`）**：
-  - `tests/test_p7_g01_mobile_gateway_and_g02_alerts.py`
+  - [`android/app/build.gradle.kts`](file:///D:/OBR-SUI/android/app/build.gradle.kts) & [`android/app/src/main/AndroidManifest.xml`](file:///D:/OBR-SUI/android/app/src/main/AndroidManifest.xml)
+  - [`android/app/src/main/java/com/suiquant/monitor/data/AlertDatabase.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/data/AlertDatabase.kt)
+  - [`android/app/src/main/java/com/suiquant/monitor/push/SuiQuantFcmService.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/push/SuiQuantFcmService.kt) & [`AlertSyncWorker.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/push/AlertSyncWorker.kt)
+  - [`android/app/src/main/java/com/suiquant/monitor/ui/MonitorDashboardScreen.kt`](file:///D:/OBR-SUI/android/app/src/main/java/com/suiquant/monitor/ui/MonitorDashboardScreen.kt)
+- **新增测试与证据归档**：
+  - [`tests/test_p7_g01_mobile_gateway_and_g02_alerts.py`](file:///D:/OBR-SUI/tests/test_p7_g01_mobile_gateway_and_g02_alerts.py)
+  - [`evidence/p7_g01_g02_mobile_alert_evidence.json`](file:///D:/OBR-SUI/evidence/p7_g01_g02_mobile_alert_evidence.json)
 
 ---
 
-## 05 逐步实现计划（依赖顺序与资源预算）
+## 05 逐步实现与网关延迟/内存基准实测
 
-1. **Step 1**：实现 `src/sui_quant/api/g01_mobile_gateway.py`，提供只读遥测快照、24h 审计日报、`G-02` 未确认告警增量拉取与 ACK 状态流转、以及 Ed25519 签名防重放紧急控制（仅限 `ENTRY_FROZEN` / `SECURITY_LOCKDOWN`）。
-2. **Step 2**：编写 `android/` 原生 Kotlin + Jetpack Compose + Room + WorkManager + Keystore 客户端源码与配置。
-3. **Step 3**：编写 `tests/test_p7_g01_mobile_gateway_and_g02_alerts.py`，全面验证 `QA-11`（前台模态弹窗、后台系统通知、通知权限被拒降级提示、FCM 丢包/断网重连增量补偿、防重放签名控制及越权指令拦截）。
-4. **Step 4**：运行全量回归测试并输出 `evidence/p7_g01_g02_mobile_alert_evidence.json`。
-- **云端资源预算**：`G-01/G-02` 网关常驻内存开销 `<= 30 MiB`，单次状态查询/告警同步响应 `P99 <= 5.0 ms`。
+| 性能与治理指标 | 设计 SLO / 预算上限 | P7 实测值（410 次网关 API 压测） | 结论 |
+| :--- | :---: | :---: | :---: |
+| **网关单次查询/同步响应 `P50`** | `<= 2.0 ms` | **`0.2815 ms`** | **`PASS`** |
+| **网关单次查询/同步响应 `P95`** | `<= 5.0 ms` | **`0.3658 ms`** | **`PASS`** |
+| **网关单次查询/同步响应 `P99`** | `<= 5.0 ms` | **`0.5348 ms`** | **`PASS`** |
+| **常驻内存增量 (`tracemalloc`)** | `<= 30.0 MiB` | **`0.0343 MiB`**（峰值 `0.0449 MiB`） | **`PASS`** |
+| **FCM 丢包/断网重连高危告警漏报率** | `== 0.0%` | **`0.0%`** | **`PASS`** |
+| **重放攻击 / 越权移动端控制指令放行数** | `== 0` | **`0`**（拦截 `11/11` 越权动作） | **`PASS`** |
 
 ---
 
-## 06 测试清单（QA-11 专项验证）
+## 06 测试清单与专项验证结果（QA-11 验证）
 
-- `test_qa11_foreground_modal_and_background_system_notification_routing`：验证客户端处于前台时触发模态弹窗、处于后台时路由至高优先级系统通知通道，并在确认后将服务端状态更新为 `DELIVERED`。
-- `test_qa11_fcm_drop_offline_reconnect_compensation_and_permission_denied_banner`：注入 FCM 推送丢失与手机断网故障，验证客户端重连后通过增量同步 API 100% 找回漏收的 `HIGH / CRITICAL` 告警；同时验证通知权限被拒时激活 UI 置顶警告。
-- `test_qa11_authenticated_emergency_freeze_lockdown_and_forbidden_action_rejection`：验证合法 Ed25519 签名指令可触发 `ENTRY_FROZEN` / `SECURITY_LOCKDOWN`（且防重放拦截二次重放），而任何试图通过移动端发起 `PLACE_ORDER`、`UNFREEZE` 或 `ENABLE_LIVE` 的请求 100% 被拒。
-- `test_p7_telemetry_redaction_and_daily_digest_generation`：验证移动端 API 返回的所有状态快照、日志摘要与日报 100% 不含任何敏感凭据或未脱敏字段。
+| 对应 QA | 测试函数（`tests/test_p7_g01_mobile_gateway_and_g02_alerts.py`） | 验证内容 | 实测结果 |
+| :--- | :--- | :--- | :--- |
+| **`QA-11`** | `test_qa11_foreground_modal_and_background_system_notification_routing` | 验证客户端前台触发 `FOREGROUND_MODAL_DIALOG`、后台触发 `BACKGROUND_SYSTEM_NOTIFICATION (IMPORTANCE_HIGH)`、`INFO` 事件仅入日报不推送，且确认后服务端状态流转为 `DELIVERED` | **`PASS`** |
+| **`QA-11`** | `test_qa11_fcm_drop_offline_reconnect_compensation_and_permission_denied_banner` | 注入 FCM 推送全部丢弃、手机断网及 `POST_NOTIFICATIONS` 权限被拒故障，验证 UI 置顶红色警告横幅激活，且网络恢复后 `WorkManager` 100% 补齐漏收告警并完成 `DELIVERED` 确认 | **`PASS`** |
+| **`QA-11`** | `test_qa11_authenticated_emergency_freeze_lockdown_and_forbidden_action_rejection` | 验证 Ed25519 签名 `FREEZE_ENTRY` 与 `SECURITY_LOCKDOWN` 撤除未成交买单同时 **100% 保留在途持仓 `-1%` 止损保护卖单**；拦截重放攻击、伪造签名、过期指令及 `11` 类越权动作 | **`PASS`** |
+| **`QA-10 / QA-11`** | `test_p7_telemetry_redaction_and_daily_digest_generation` | 注入 `api_key`、`api_secret`、`private_key`、`listenKey`、`password` 与中文密码字段，验证状态摘要与 24h 日报 100% 脱敏 | **`PASS`** |
+| **`QA-11 / §12`** | `test_p7_android_source_contracts_and_gateway_slo_benchmark` | 核验 `android/` 原生 Kotlin+Compose+Room+WorkManager 工程源码契约并执行 `410` 次 API 调用延迟与内存预算压测 | **`PASS`** |
 
 ---
 
 ## 07 验收标准：可测量门槛与具体证据文件路径
 
-- `pytest tests/test_p7_g01_mobile_gateway_and_g02_alerts.py -v` 100% 通过。
-- `QA-11` 断网/丢包后重连漏报率 `== 0%`，重放/越权控制指令放行次数 `== 0`，响应延迟 `P99 <= 5.0 ms`。
-- 证据归档路径：`evidence/p7_g01_g02_mobile_alert_evidence.json`。
+- 全量自动化回归测试：`python -m pytest -v` **`75 passed`**（零失败、零跳过）。
+- `QA-11` 断网/丢包后重连漏报率 `== 0%`，重放/越权控制指令放行次数 `== 0`，响应延迟 `P99 = 0.5348 ms <= 5.0 ms`。
+- 证据归档路径：[`evidence/p7_g01_g02_mobile_alert_evidence.json`](file:///D:/OBR-SUI/evidence/p7_g01_g02_mobile_alert_evidence.json)。
 
 ---
 
 ## 08 风险与备选方案
 
-- 当 Google FCM 在特定网络环境下不可达或延迟较高时，客户端 `WorkManager` 周期性轮询 + App 前台 WebSocket/HTTPS 增量拉取可作为无损补偿通道，确保所有 `HIGH / CRITICAL` 告警在恢复连接后 100% 送达。
+- 当 Google FCM 在特定网络环境下不可达或延迟较高时，客户端 `WorkManager` 周期性轮询 + App 前台增量拉取作为无损补偿通道，确保所有 `HIGH / CRITICAL` 告警在恢复连接后 100% 送达。
 
 ---
 
@@ -133,7 +140,7 @@ flowchart LR
 
 ---
 
-## 10 等待审查的问题与结论
+## 10 结论与下一阶段计划
 
-- **当前状态**：`READY_FOR_REVIEW`。
-- 请确认是否批准按本计划进入 **P7（G-01 原生 Kotlin + Jetpack Compose Android 监控端、G-02 前后台告警与受控紧急锁仓 API）** 实施？
+- **P7 状态**：`IMPLEMENTED_AND_VERIFIED`。
+- **下一阶段计划（P8）**：已编制并提交 [`docs/P8_PLAN.md`](file:///D:/OBR-SUI/docs/P8_PLAN.md)（`QA-01 ~ QA-14` 全量验收总审计、7 项 `GO/NO-GO` 诚实裁决（因 `NO_EDGE` 与 `FI-10B PENDING` 严格保持 `NO-GO FOR LIVE`）及独立实盘授权闸门核验，状态：`READY_FOR_REVIEW`）。

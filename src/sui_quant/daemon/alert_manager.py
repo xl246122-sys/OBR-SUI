@@ -115,20 +115,8 @@ class AlertManager:
             push_attempts = 0
         else:
             push_attempts = 1
-            if self.push_sender is not None:
-                try:
-                    ok = bool(self.push_sender(alert_obj, sanitized_details))
-                except Exception:
-                    ok = False
-                if ok:
-                    delivery_status = DeliveryStatus.SENT_AWAITING_ACK
-                    push_dispatched = True
-                else:
-                    delivery_status = DeliveryStatus.FAILED_RETRYING
-                    push_dispatched = False
-            else:
-                delivery_status = DeliveryStatus.PENDING
-                push_dispatched = False
+            delivery_status = DeliveryStatus.PENDING
+            push_dispatched = False
 
         conn.execute(
             """
@@ -151,6 +139,42 @@ class AlertManager:
                 json.dumps(sanitized_details, ensure_ascii=False),
             ),
         )
+
+        if severity != AlertSeverity.INFO and self.push_sender is not None:
+            try:
+                ok = bool(self.push_sender(alert_obj, sanitized_details))
+            except Exception:
+                ok = False
+            if ok:
+                push_dispatched = True
+                conn.execute(
+                    """
+                    UPDATE alert_events
+                    SET delivery_status = ?
+                    WHERE alert_id = ? AND delivery_status != ?
+                    """,
+                    (
+                        DeliveryStatus.SENT_AWAITING_ACK.value,
+                        alert_id,
+                        DeliveryStatus.DELIVERED.value,
+                    ),
+                )
+                row_after = conn.execute(
+                    "SELECT delivery_status FROM alert_events WHERE alert_id = ?",
+                    (alert_id,),
+                ).fetchone()
+                delivery_status = (
+                    DeliveryStatus(str(row_after["delivery_status"]))
+                    if row_after is not None
+                    else DeliveryStatus.SENT_AWAITING_ACK
+                )
+            else:
+                delivery_status = DeliveryStatus.FAILED_RETRYING
+                push_dispatched = False
+                conn.execute(
+                    "UPDATE alert_events SET delivery_status = ? WHERE alert_id = ?",
+                    (delivery_status.value, alert_id),
+                )
 
         return AlertDispatchResult(
             alert_event=alert_obj,
