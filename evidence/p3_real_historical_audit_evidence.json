@@ -1,0 +1,321 @@
+{
+  "dataset_summary": {
+    "source": "Binance Spot Public REST API (/api/v3/klines)",
+    "symbols": [
+      "SUIUSDT",
+      "BTCUSDT"
+    ],
+    "sui_5m_start_utc": "2026-09-01T07:05:00+00:00",
+    "sui_5m_end_utc": "2026-10-31T07:00:00+00:00",
+    "sui_5m_closed_bars": 17280,
+    "btc_5m_closed_bars": 17280,
+    "sui_15m_closed_bars": 5760,
+    "sui_1h_closed_bars": 1440,
+    "raw_price_breakout_bars": 974,
+    "qualified_a02_candidate_events": 458,
+    "entry_price_mode": "NEXT_BAR_OPEN",
+    "htf_causality_verified_events": 974,
+    "no_time_travel_verified_events": 458,
+    "same_bar_ambiguous_conflicts_resolved_to_stop": 0
+  },
+  "overall_label_distribution": {
+    "count": 458,
+    "WIN": 119,
+    "STOP": 237,
+    "TIMEOUT": 102,
+    "win_pct": 25.98,
+    "stop_pct": 51.75,
+    "timeout_pct": 22.27,
+    "start_utc": "2026-09-01T11:35:00+00:00",
+    "end_utc": "2026-10-30T23:40:00+00:00"
+  },
+  "three_stage_split_summary": {
+    "embargo_bars": 36,
+    "min_bar_gap_train_to_cal": 47,
+    "min_bar_gap_cal_to_test": 47,
+    "min_time_gap_hours_train_to_cal": 3.92,
+    "min_time_gap_hours_cal_to_test": 3.92,
+    "purged_train_to_cal_count": 1,
+    "purged_cal_to_test_count": 0,
+    "TRAIN": {
+      "count": 228,
+      "WIN": 79,
+      "STOP": 115,
+      "TIMEOUT": 34,
+      "win_pct": 34.65,
+      "stop_pct": 50.44,
+      "timeout_pct": 14.91,
+      "start_utc": "2026-09-01T11:35:00+00:00",
+      "end_utc": "2026-09-29T07:40:00+00:00"
+    },
+    "CALIBRATION": {
+      "count": 114,
+      "WIN": 28,
+      "STOP": 55,
+      "TIMEOUT": 31,
+      "win_pct": 24.56,
+      "stop_pct": 48.25,
+      "timeout_pct": 27.19,
+      "start_utc": "2026-09-29T11:35:00+00:00",
+      "end_utc": "2026-10-14T03:35:00+00:00"
+    },
+    "FINAL_TEST": {
+      "count": 115,
+      "WIN": 11,
+      "STOP": 67,
+      "TIMEOUT": 37,
+      "win_pct": 9.57,
+      "stop_pct": 58.26,
+      "timeout_pct": 32.17,
+      "start_utc": "2026-10-14T07:30:00+00:00",
+      "end_utc": "2026-10-30T23:40:00+00:00"
+    }
+  },
+  "walk_forward_folds": [
+    {
+      "fold_id": 0,
+      "train_count": 126,
+      "val_count": 109,
+      "purged_count": 3,
+      "min_bar_gap": 103,
+      "val_distribution": {
+        "count": 109,
+        "WIN": 52,
+        "STOP": 56,
+        "TIMEOUT": 1,
+        "win_pct": 47.71,
+        "stop_pct": 51.38,
+        "timeout_pct": 0.92,
+        "start_utc": "2026-09-19T19:45:00+00:00",
+        "end_utc": "2026-09-30T13:10:00+00:00"
+      }
+    },
+    {
+      "fold_id": 1,
+      "train_count": 238,
+      "val_count": 109,
+      "purged_count": 0,
+      "min_bar_gap": 37,
+      "val_distribution": {
+        "count": 109,
+        "WIN": 24,
+        "STOP": 54,
+        "TIMEOUT": 31,
+        "win_pct": 22.02,
+        "stop_pct": 49.54,
+        "timeout_pct": 28.44,
+        "start_utc": "2026-09-30T16:15:00+00:00",
+        "end_utc": "2026-10-14T12:05:00+00:00"
+      }
+    },
+    {
+      "fold_id": 2,
+      "train_count": 346,
+      "val_count": 111,
+      "purged_count": 1,
+      "min_bar_gap": 48,
+      "val_distribution": {
+        "count": 111,
+        "WIN": 11,
+        "STOP": 63,
+        "TIMEOUT": 37,
+        "win_pct": 9.91,
+        "stop_pct": 56.76,
+        "timeout_pct": 33.33,
+        "start_utc": "2026-10-14T12:10:00+00:00",
+        "end_utc": "2026-10-30T23:40:00+00:00"
+      }
+    }
+  ],
+  "stage_metrics": {
+    "TRAIN": {
+      "brier_score": "0.576414",
+      "baseline_brier_score": "0.603301",
+      "brier_skill_score": "0.044567",
+      "ece": "0.067670",
+      "log_loss": "0.947214",
+      "baseline_log_loss": "0.996232",
+      "oof_sample_count": "228"
+    },
+    "CALIBRATION": {
+      "brier_score": "0.610479",
+      "baseline_brier_score": "0.632964",
+      "brier_skill_score": "0.035524",
+      "ece": "0.040846",
+      "log_loss": "1.008236",
+      "baseline_log_loss": "1.050596",
+      "oof_sample_count": "114"
+    },
+    "FINAL_TEST": {
+      "brier_score": "0.573479",
+      "baseline_brier_score": "0.547902",
+      "brier_skill_score": "-0.046683",
+      "ece": "0.105360",
+      "log_loss": "0.951475",
+      "baseline_log_loss": "0.904104",
+      "oof_sample_count": "115",
+      "mean_ev_net": "-0.002812",
+      "mean_realized_net_return": "-0.007098",
+      "positive_ev_count": "0"
+    }
+  },
+  "final_test_bootstrap_95_ci": {
+    "brier_score": [
+      "0.540229",
+      "0.605820"
+    ],
+    "log_loss": [
+      "0.908559",
+      "0.995373"
+    ],
+    "ece": [
+      "0.073883",
+      "0.147872"
+    ],
+    "mean_ev_net": [
+      "-0.002911",
+      "-0.002691"
+    ],
+    "mean_realized_net_return": [
+      "-0.008489",
+      "-0.005184"
+    ]
+  },
+  "cost_sensitivity_matrix_final_test": {
+    "tier1_vip_maker_bnb_low_cost": {
+      "round_trip_fee_bps": "12.000000",
+      "net_win_payoff": "0.014700",
+      "net_stop_payoff": "-0.011784",
+      "net_timeout_payoff": "0.000351",
+      "mean_ev_net": "-0.001690",
+      "positive_ev_trade_count": "2",
+      "positive_ev_ratio": "0.017391"
+    },
+    "tier2_standard_spot_baseline": {
+      "round_trip_fee_bps": "20.000000",
+      "net_win_payoff": "0.014300",
+      "net_stop_payoff": "-0.013172",
+      "net_timeout_payoff": "-0.000949",
+      "mean_ev_net": "-0.002812",
+      "positive_ev_trade_count": "0",
+      "positive_ev_ratio": "0.000000"
+    },
+    "tier3_stressed_slippage": {
+      "round_trip_fee_bps": "20.000000",
+      "net_win_payoff": "0.013600",
+      "net_stop_payoff": "-0.014564",
+      "net_timeout_payoff": "-0.001949",
+      "mean_ev_net": "-0.003917",
+      "positive_ev_trade_count": "0",
+      "positive_ev_ratio": "0.000000"
+    },
+    "tier4_extreme_illiquidity_stress": {
+      "round_trip_fee_bps": "30.000000",
+      "net_win_payoff": "0.012800",
+      "net_stop_payoff": "-0.017140",
+      "net_timeout_payoff": "-0.004048",
+      "mean_ev_net": "-0.005918",
+      "positive_ev_trade_count": "0",
+      "positive_ev_ratio": "0.000000"
+    }
+  },
+  "btc_flash_drop_ablation": {
+    "explicit_windows": {
+      "5m_window_1bar": "<= -0.80%",
+      "15m_window_3bars": "<= -1.50%",
+      "30m_window_6bars": "<= -2.20%"
+    },
+    "all_5m_bars_btc_veto_triggers": {
+      "total_5m_bars_vetoed_60d": 13,
+      "total_5m_bars_vetoed_oos": 3,
+      "window_trigger_breakdown_60d": {
+        "btc_5m_flash_drop": 8,
+        "btc_15m_flash_drop": 7,
+        "btc_30m_flash_drop": 1
+      }
+    },
+    "sui_uptick_bars_during_btc_flash_drop": {
+      "vetoed_upticks_60d": {
+        "count": 1,
+        "WIN": 0,
+        "STOP": 1,
+        "TIMEOUT": 0,
+        "win_rate": "0.0",
+        "stop_rate": "1.0",
+        "mean_realized_net_return": "-0.013217"
+      },
+      "vetoed_upticks_oos": {
+        "count": 0
+      },
+      "oos_upticks_with_btc_filter_count": 2352,
+      "oos_upticks_without_btc_filter_count": 2352,
+      "oos_upticks_mean_net_return_with_btc_filter": "-0.004205",
+      "oos_upticks_mean_net_return_without_btc_filter": "-0.004205"
+    },
+    "final_test_set": {
+      "with_btc_filter": {
+        "accepted_trades": 115,
+        "btc_vetoed_trades": 0,
+        "win_count": 11,
+        "stop_count": 67,
+        "timeout_count": 37,
+        "win_rate": "0.095652",
+        "stop_rate": "0.582609",
+        "mean_realized_net_return": "-0.007098",
+        "mean_ev_net": "-0.002812"
+      },
+      "without_btc_filter": {
+        "accepted_trades": 115,
+        "btc_vetoed_trades": 0,
+        "win_count": 11,
+        "stop_count": 67,
+        "timeout_count": 37,
+        "win_rate": "0.095652",
+        "stop_rate": "0.582609",
+        "mean_realized_net_return": "-0.007098",
+        "mean_ev_net": "-0.002812"
+      }
+    },
+    "full_60d_dataset": {
+      "with_btc_filter": {
+        "accepted_trades": 458,
+        "btc_vetoed_trades": 0,
+        "win_count": 119,
+        "stop_count": 237,
+        "timeout_count": 102,
+        "win_rate": "0.259825",
+        "stop_rate": "0.517467",
+        "mean_realized_net_return": "-0.003440",
+        "mean_ev_net": "-0.003059"
+      },
+      "without_btc_filter": {
+        "accepted_trades": 458,
+        "btc_vetoed_trades": 0,
+        "win_count": 119,
+        "stop_count": 237,
+        "timeout_count": 102,
+        "win_rate": "0.259825",
+        "stop_rate": "0.517467",
+        "mean_realized_net_return": "-0.003440",
+        "mean_ev_net": "-0.003059"
+      }
+    }
+  },
+  "cost_accounting_audit": {
+    "double_fee_counting_detected": "False",
+    "entry_price": "2.0000",
+    "win_barrier_price": "2.0341",
+    "stop_barrier_price": "1.9800",
+    "realized_win_label_net": "0.015018",
+    "net_win_payoff": "0.014300",
+    "label_stop_net_return": "-0.012472",
+    "net_stop_payoff": "-0.013172",
+    "label_timeout_net_return": "-0.000249",
+    "net_timeout_payoff": "-0.000949",
+    "execution_entry_friction": "0.000700"
+  },
+  "statistical_verdict": "NO_EDGE",
+  "verdict_reasons": [
+    "NON_POSITIVE_OOS_NET_EXPECTANCY(mean_realized=-0.007098,mean_ev=-0.002812)"
+  ]
+}

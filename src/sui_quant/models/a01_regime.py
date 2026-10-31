@@ -1,4 +1,4 @@
-"""A-01 Mathematical Market Regime Classifier (§3, §7.1, P3_PLAN).
+"""A-01 Mathematical Market Regime Classifier (§3, §7.1, P3_PLAN, Task A.7).
 
 Classifies the market environment into 5 mutually exclusive states (`RegimeType`):
 - `UP_TREND`: Sustained directional upward momentum with supportive multi-horizon alignment.
@@ -7,8 +7,11 @@ Classifies the market environment into 5 mutually exclusive states (`RegimeType`
 - `HIGH_VOLATILITY`: Extreme ATR / realized return dispersion; new entries strictly forbidden (`allow_entry=False`).
 - `DATA_UNHEALTHY`: Stale, gapped, incomplete, or missing market data; new entries strictly forbidden (`allow_entry=False`).
 
-Also enforces the `BTCUSDT` short-window flash-crash veto: if `BTCUSDT` experiences a sharp drop,
-`allow_entry` is forced to `False` regardless of `SUIUSDT` local momentum.
+Task A.7 Explicit `BTCUSDT` Flash-Crash Time Windows & Ablation Support:
+- `5m` window (`1` closed 5m bar `[t-5m, t]`): `btc_ret_5m <= -0.80%` (`Decimal("-0.0080")`)
+- `15m` window (`3` closed 5m bars `[t-15m, t]`): `btc_ret_15m <= -1.50%` (`Decimal("-0.0150")`)
+- `30m` window (`6` closed 5m bars `[t-30m, t]`): `btc_ret_30m <= -2.20%` (`Decimal("-0.0220")`)
+- Supports `enable_btc_flash_drop_filter=True/False` for rigorous out-of-sample ablation comparison.
 """
 
 from __future__ import annotations
@@ -42,7 +45,7 @@ def _q6(val: Decimal) -> Decimal:
 
 @dataclass(frozen=True)
 class A01RegimeConfig:
-    """Hyperparameters and safety thresholds for the A-01 5-state regime classifier."""
+    """Hyperparameters and safety thresholds for the A-01 5-state regime classifier (Task A.7)."""
 
     model_version: str = "a01-regime-v1.0.0"
     decision_ttl_seconds: int = 300  # 5 minutes (valid until next 5m close)
@@ -51,9 +54,16 @@ class A01RegimeConfig:
     up_trend_score_threshold: Decimal = Decimal("0.6500")
     down_trend_score_threshold: Decimal = Decimal("-0.5500")
     down_trend_ret_12_threshold: Decimal = Decimal("-0.0150")          # <= -1.5% over 1h -> DOWN_TREND
-    btc_flash_drop_1bar_threshold: Decimal = Decimal("-0.0080")        # <= -0.8% in 5m -> veto entry
-    btc_flash_drop_3bar_threshold: Decimal = Decimal("-0.0150")        # <= -1.5% in 15m -> veto entry
-    btc_flash_drop_6bar_threshold: Decimal = Decimal("-0.0220")        # <= -2.2% in 30m -> veto entry
+
+    # Task A.7: Explicit BTC flash-drop time windows (5m = 1 bar, 15m = 3 bars, 30m = 6 bars)
+    enable_btc_flash_drop_filter: bool = True
+    btc_flash_drop_5m_window_minutes: int = 5
+    btc_flash_drop_15m_window_minutes: int = 15
+    btc_flash_drop_30m_window_minutes: int = 30
+    btc_flash_drop_1bar_threshold: Decimal = Decimal("-0.0080")        # <= -0.80% over 5m (1 closed 5m bar)
+    btc_flash_drop_3bar_threshold: Decimal = Decimal("-0.0150")        # <= -1.50% over 15m (3 closed 5m bars)
+    btc_flash_drop_6bar_threshold: Decimal = Decimal("-0.0220")        # <= -2.20% over 30m (6 closed 5m bars)
+
     min_entry_confidence: Decimal = Decimal("0.4000")
     allow_consolidation_breakout_entry: bool = True
     softmax_temperature: Decimal = Decimal("1.1500")
@@ -61,13 +71,15 @@ class A01RegimeConfig:
 
 @dataclass(frozen=True)
 class A01RegimeDiagnostics:
-    """Rich mathematical diagnostics accompanying a `RegimeDecision`."""
+    """Rich mathematical diagnostics accompanying a `RegimeDecision` (including Task A.7 window tags)."""
 
     trend_strength: Decimal
     volatility_ratio: Decimal
     btc_ret_1: Decimal
     btc_ret_3: Decimal
+    btc_ret_6: Decimal
     btc_veto_triggered: bool
+    btc_veto_windows: tuple[str, ...]
     regime_probabilities: Mapping[RegimeType, Decimal]
     feature_snapshot_hash: str
 
@@ -176,7 +188,9 @@ class A01RegimeClassifier:
                 volatility_ratio=Decimal("0"),
                 btc_ret_1=Decimal("0"),
                 btc_ret_3=Decimal("0"),
+                btc_ret_6=Decimal("0"),
                 btc_veto_triggered=False,
+                btc_veto_windows=(),
                 regime_probabilities=probs,
                 feature_snapshot_hash="UNHEALTHY",
             )
@@ -199,24 +213,27 @@ class A01RegimeClassifier:
         ret_15m_1 = require_decimal(f.get("ret_15m_1", ret_3), "ret_15m_1")
         ret_1h_1 = require_decimal(f.get("ret_1h_1", ret_12), "ret_1h_1")
 
-        # Extract BTC returns from either explicit `btc_features` or embedded cross-asset keys
+        # Extract BTC returns across explicit 5m (1 bar), 15m (3 bars), and 30m (6 bars) windows
         if btc_features is not None:
             bf = btc_features.features
             btc_ret_1 = require_decimal(bf.get("ret_1", bf.get("btc_ret_1", Decimal("0"))), "btc_ret_1")
             btc_ret_3 = require_decimal(bf.get("ret_3", bf.get("btc_ret_3", Decimal("0"))), "btc_ret_3")
             btc_ret_6 = require_decimal(bf.get("ret_6", bf.get("btc_ret_6", Decimal("0"))), "btc_ret_6")
         else:
-            btc_ret_1 = require_decimal(f.get("btc_ret_1", Decimal("0")), "btc_ret_1")
-            btc_ret_3 = require_decimal(f.get("btc_ret_3", Decimal("0")), "btc_ret_3")
-            btc_ret_6 = require_decimal(f.get("btc_ret_6", Decimal("0")), "btc_ret_6")
+            btc_ret_1 = require_decimal(f.get("btc_ret_5m", f.get("btc_ret_1", Decimal("0"))), "btc_ret_1")
+            btc_ret_3 = require_decimal(f.get("btc_ret_15m", f.get("btc_ret_3", Decimal("0"))), "btc_ret_3")
+            btc_ret_6 = require_decimal(f.get("btc_ret_30m", f.get("btc_ret_6", Decimal("0"))), "btc_ret_6")
 
-        btc_flag = require_decimal(f.get("btc_flash_drop_flag", Decimal("0")), "btc_flash_drop_flag")
-        btc_veto = (
-            btc_flag >= Decimal("1")
-            or btc_ret_1 <= cfg.btc_flash_drop_1bar_threshold
-            or btc_ret_3 <= cfg.btc_flash_drop_3bar_threshold
-            or btc_ret_6 <= cfg.btc_flash_drop_6bar_threshold
-        )
+        veto_windows: list[str] = []
+        if btc_ret_1 <= cfg.btc_flash_drop_1bar_threshold:
+            veto_windows.append("BTC_DROP_5M_LE_MINUS_80BPS")
+        if btc_ret_3 <= cfg.btc_flash_drop_3bar_threshold:
+            veto_windows.append("BTC_DROP_15M_LE_MINUS_150BPS")
+        if btc_ret_6 <= cfg.btc_flash_drop_6bar_threshold:
+            veto_windows.append("BTC_DROP_30M_LE_MINUS_220BPS")
+
+        raw_btc_drop = len(veto_windows) > 0
+        btc_veto = bool(cfg.enable_btc_flash_drop_filter and raw_btc_drop)
 
         # 2. Mathematical Trend Strength & Volatility Normalization
         vol_scale = max(atr_14_pct, Decimal("0.0025"))
@@ -311,11 +328,13 @@ class A01RegimeClassifier:
             allow_entry = cfg.allow_consolidation_breakout_entry
             reason_codes.append("CONSOLIDATION_RANGE")
 
-        # 5. Enforce BTCUSDT Short-Window Flash Crash Veto
+        # 5. Enforce BTCUSDT Short-Window Flash Crash Veto (Task A.7)
         if btc_veto:
             allow_entry = False
             if "BTC_FLASH_DROP_VETO" not in reason_codes:
                 reason_codes.append("BTC_FLASH_DROP_VETO")
+            for w_tag in veto_windows:
+                reason_codes.append(w_tag)
 
         # 6. Enforce Minimum Confidence Gate
         if allow_entry and confidence < cfg.min_entry_confidence:
@@ -340,7 +359,9 @@ class A01RegimeClassifier:
             volatility_ratio=volatility_ratio,
             btc_ret_1=btc_ret_1,
             btc_ret_3=btc_ret_3,
+            btc_ret_6=btc_ret_6,
             btc_veto_triggered=btc_veto,
+            btc_veto_windows=tuple(veto_windows),
             regime_probabilities=probs,
             feature_snapshot_hash=feat_hash,
         )

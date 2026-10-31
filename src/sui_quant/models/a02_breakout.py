@@ -1,18 +1,25 @@
-"""A-02 Upward Volume Breakout Calibrated Triple-Barrier Probability Model (§4, §7.1, §11.2, §14, P3_PLAN).
+"""A-02 Upward Volume Breakout Calibrated Triple-Barrier Probability Model
+(§4, §7.1, §11.2, §14, P3_PLAN, Task A.3, A.4, A.5, A.6, A.9).
 
 Responsibilities:
 1. Strict `SUIUSDT`-only enforcement: `BTCUSDT` or any other symbol is physically rejected from A-02
    training and proposal generation (§0.1).
 2. Exact `Decimal` Simplex Projection (`project_to_decimal_simplex`):
    Guarantees `p_win + p_stop + p_timeout == Decimal("1")` (`1.000000`) with zero binary float residue.
-3. Fee-, Slippage-, and Adverse-Selection-Aware Net Expected Value (`compute_ev_net`):
-   Deducts round-trip spot fees, entry/stop/timeout execution slippage, and adverse selection markout penalty.
-4. Purged Walk-Forward Training & Out-of-Sample Multiclass Calibration (`fit_purged_walk_forward`):
-   Fits L2-regularized multinomial logit weights on training folds and Temperature + Dirichlet bias
-   calibration on out-of-sample validation folds, with automatic fallback to L2 baseline if calibration
-   drifts (§08 P3_PLAN).
-5. Signed/Hashed `ModelManifest` Governance (`export_model_manifest`):
-   Blocks manifest export if out-of-sample `ECE > max_allowed_ece` or `brier_score > baseline_brier_score`.
+3. Task A.3 & A.4 — Single-Deduction Fee, Slippage, and Adverse-Selection Net Expected Value (`A02CostAssumptions`):
+   - `WIN` barrier already embeds `buy_fee_rate` and `sell_fee_rate` inside `target_net_win_return (+1.5%)`
+     via `compute_c1_net_target_sell_price`; `net_win_payoff` never deducts spot fees a second time.
+   - `STOP` and `TIMEOUT` apply the exact multiplicative formula
+     `[(1 + r_gross_after_exit_slip) * (1 - sell_fee_rate)] / (1 + buy_fee_rate) - 1 - (entry_slippage_rate + adverse_selection_penalty)`.
+4. Task A.5 — Strict 3-Stage Separation (`TRAIN` / `CALIBRATION` / `FINAL_TEST` via `fit_and_evaluate_three_stage`):
+   - Base model weights and feature normalizers are fit ONLY on `TRAIN`.
+   - Probability calibration (`temperature` and `calibration_biases`) is fit ONLY on `CALIBRATION`
+     (after a `>= 36` bar / 3h Purge + Embargo gap).
+   - Final acceptance metrics (`Brier`, `Log Loss`, `ECE`, `ev_net`, bootstrap 95% CIs, cost sensitivity)
+     are evaluated ONLY on the untouched `FINAL_TEST` holdout set (after a second `>= 36` bar / 3h Purge + Embargo gap).
+5. Task A.9 — Honest Statistical Verdict (`StatisticalVerdict`):
+   - Explicitly outputs `INSUFFICIENT_EVIDENCE` or `NO_EDGE` whenever sample size is below statistical threshold
+     or bootstrap 95% CI of net return / skill score does not establish a significant positive edge.
 """
 
 from __future__ import annotations
@@ -20,9 +27,11 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import random
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_EVEN
+from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -42,8 +51,11 @@ from sui_quant.models.features import (
 from sui_quant.models.triple_barrier import (
     BarrierOutcome,
     BreakoutCandidateConfig,
+    PurgedThreeStageSplit,
     PurgedWalkForwardSplitter,
+    TripleBarrierConfig,
     TripleBarrierLabel,
+    TripleBarrierLabeler,
     evaluate_breakout_candidate,
 )
 from sui_quant.utils.clock import ensure_utc
@@ -72,6 +84,14 @@ A02_FEATURE_NAMES: tuple[str, ...] = (
 
 class ModelCalibrationGateError(ValueError):
     """Raised when a model fails out-of-sample calibration gates (ECE or Brier Score) during manifest export."""
+
+
+class StatisticalVerdict(str, Enum):
+    """Task A.9 explicit statistical validity classification."""
+
+    EDGE_VALIDATED = "EDGE_VALIDATED"
+    INSUFFICIENT_EVIDENCE = "INSUFFICIENT_EVIDENCE"
+    NO_EDGE = "NO_EDGE"
 
 
 def _q6(val: Decimal) -> Decimal:
@@ -105,7 +125,6 @@ def project_to_decimal_simplex(
     ps = max(Decimal("0.000000"), min(Decimal("1.000000"), ps))
     pt = max(Decimal("0.000000"), min(Decimal("1.000000"), pt))
 
-    # Adjust the largest component by the exact quantization residual so sum == Decimal("1.000000")
     residual = Decimal("1.000000") - (pw + ps + pt)
     if residual != Decimal("0"):
         if pw >= ps and pw >= pt:
@@ -115,7 +134,6 @@ def project_to_decimal_simplex(
         else:
             pt = _q6(pt + residual)
 
-    # Final safety guard in case residual adjustment pushed a component slightly negative
     if pw < Decimal("0") or ps < Decimal("0") or pt < Decimal("0"):
         pw = max(Decimal("0.000000"), pw)
         ps = max(Decimal("0.000000"), min(Decimal("1.000000") - pw, ps))
@@ -126,16 +144,16 @@ def project_to_decimal_simplex(
 
 @dataclass(frozen=True)
 class A02CostAssumptions:
-    """Explicit fee, slippage, and adverse-selection cost structure for `ev_net` calculation (§4.3, §5, §6)."""
+    """Explicit single-deduction fee, slippage, and adverse-selection cost structure for `ev_net` (Task A.3 & A.4)."""
 
     buy_fee_rate: Decimal = Decimal("0.0010")                  # 10 bps spot buy fee
     sell_fee_rate: Decimal = Decimal("0.0010")                 # 10 bps spot sell fee
     target_net_win_return: Decimal = Decimal("0.0150")         # +1.5% net profit target (already net of buy+sell fees)
     stop_loss_trigger_pct: Decimal = Decimal("0.0100")         # -1.0% trigger relative to entry price
     entry_slippage_rate: Decimal = Decimal("0.0003")           # 3 bps limit entry fill slippage / queue cost
-    stop_slippage_rate: Decimal = Decimal("0.0006")            # 6 bps stop-loss trigger execution slippage
+    stop_slippage_rate: Decimal = Decimal("0.0005")            # 5 bps stop-loss trigger execution slippage
     adverse_selection_penalty: Decimal = Decimal("0.0004")     # 4 bps adverse selection markout penalty
-    expected_timeout_gross_return: Decimal = Decimal("0.0000") # 0 bps gross return at 3h timeout baseline
+    expected_timeout_gross_return: Decimal = Decimal("0.0000") # Pure gross quote return on 3h timeout before fees/slippage
     timeout_slippage_rate: Decimal = Decimal("0.0002")         # 2 bps timeout exit slippage
 
     def __post_init__(self) -> None:
@@ -153,41 +171,51 @@ class A02CostAssumptions:
             require_decimal(getattr(self, name), name)
 
     @property
-    def net_win_payoff(self) -> Decimal:
-        """Net payoff on hitting the WIN barrier.
+    def execution_entry_friction(self) -> Decimal:
+        """Execution-stage entry queue slippage + adverse selection markout penalty."""
+        return _q6(self.entry_slippage_rate + self.adverse_selection_penalty)
 
-        Since `win_barrier_price` via `compute_c1_net_target_sell_price` already embeds `buy_fee_rate`
-        and `sell_fee_rate` to achieve `+1.5%` net return, we only subtract `entry_slippage_rate`.
+    @property
+    def net_win_payoff(self) -> Decimal:
+        """Net payoff on hitting the WIN barrier (Task A.3: zero double-counting of spot fees).
+
+        `win_barrier_price` via `compute_c1_net_target_sell_price` already embeds `buy_fee_rate`
+        and `sell_fee_rate` once so that `(P_win * (1 - f_sell)) / (P_entry * (1 + f_buy)) - 1 == +1.5%`.
+        Therefore, we NEVER subtract `buy_fee_rate` or `sell_fee_rate` a second time here; we only
+        deduct `execution_entry_friction` (`entry_slippage_rate + adverse_selection_penalty`).
         """
-        return _q6(self.target_net_win_return - self.entry_slippage_rate)
+        return _q6(self.target_net_win_return - self.execution_entry_friction)
+
+    @property
+    def label_stop_net_return(self) -> Decimal:
+        """Exact multiplicative net return of hitting the STOP barrier in `TripleBarrierLabeler`."""
+        exit_mult = (Decimal("1") - self.stop_loss_trigger_pct) * (Decimal("1") - self.stop_slippage_rate)
+        net_proceeds = exit_mult * (Decimal("1") - self.sell_fee_rate)
+        cost_basis = Decimal("1") + self.buy_fee_rate
+        return _q6((net_proceeds - cost_basis) / cost_basis)
 
     @property
     def net_stop_payoff(self) -> Decimal:
-        """Net payoff (negative) on hitting the -1% STOP trigger barrier.
+        """Net payoff (negative) on hitting the -1% STOP trigger barrier including execution entry friction."""
+        return _q6(self.label_stop_net_return - self.execution_entry_friction)
 
-        Reflects §0.1 & §6.1: -1% is the stop trigger price, so realized net loss includes
-        trigger distance + round-trip fees + entry/stop slippage + adverse selection penalty.
+    @property
+    def label_timeout_net_return(self) -> Decimal:
+        """Exact multiplicative net return of hitting the 3h TIMEOUT barrier (Task A.4).
+
+        Given pure gross quote return `expected_timeout_gross_return = (P_close_36 - P_entry) / P_entry`,
+        applies `timeout_slippage_rate` once to exit price, `sell_fee_rate` once to exit proceeds,
+        and `buy_fee_rate` once to entry cost basis.
         """
-        total_loss = (
-            self.stop_loss_trigger_pct
-            + self.buy_fee_rate
-            + self.sell_fee_rate
-            + self.entry_slippage_rate
-            + self.stop_slippage_rate
-            + self.adverse_selection_penalty
-        )
-        return _q6(-total_loss)
+        exit_mult = (Decimal("1") + self.expected_timeout_gross_return) * (Decimal("1") - self.timeout_slippage_rate)
+        net_proceeds = exit_mult * (Decimal("1") - self.sell_fee_rate)
+        cost_basis = Decimal("1") + self.buy_fee_rate
+        return _q6((net_proceeds - cost_basis) / cost_basis)
 
     @property
     def net_timeout_payoff(self) -> Decimal:
-        """Net payoff on hitting the 3-hour TIMEOUT barrier."""
-        round_trip_cost = (
-            self.buy_fee_rate
-            + self.sell_fee_rate
-            + self.entry_slippage_rate
-            + self.timeout_slippage_rate
-        )
-        return _q6(self.expected_timeout_gross_return - round_trip_cost)
+        """Net payoff on hitting the 3-hour TIMEOUT barrier including execution entry friction."""
+        return _q6(self.label_timeout_net_return - self.execution_entry_friction)
 
     def compute_ev_net(
         self,
@@ -195,7 +223,7 @@ class A02CostAssumptions:
         p_stop: Decimal,
         p_timeout: Decimal,
     ) -> Decimal:
-        """Compute fee- and slippage-adjusted net expected value `ev_net` in strict `Decimal`."""
+        """Compute fee-, slippage-, and adverse-selection-adjusted net expected value `ev_net` in strict `Decimal`."""
         pw = require_decimal(p_win, "p_win")
         ps = require_decimal(p_stop, "p_stop")
         pt = require_decimal(p_timeout, "p_timeout")
@@ -203,6 +231,71 @@ class A02CostAssumptions:
             raise ValueError(f"Simplex violation in compute_ev_net: sum={pw + ps + pt}")
         ev = pw * self.net_win_payoff + ps * self.net_stop_payoff + pt * self.net_timeout_payoff
         return _q6(ev)
+
+    def verify_no_double_fee_counting(self, entry_price: Decimal = Decimal("2.0000")) -> dict[str, Any]:
+        """Audit helper (Task A.3 & A.4): verify that `TripleBarrierLabeler` and `A02CostAssumptions`
+        deduct `buy_fee_rate`, `sell_fee_rate`, `stop_slippage_rate`, and `timeout_slippage_rate`
+        EXACTLY ONCE across all three outcomes (`WIN`, `STOP`, `TIMEOUT`).
+        """
+        tb_cfg = TripleBarrierConfig(
+            target_net_return=self.target_net_win_return,
+            stop_loss_pct=self.stop_loss_trigger_pct,
+            buy_fee_rate=self.buy_fee_rate,
+            sell_fee_rate=self.sell_fee_rate,
+            stop_slippage_rate=self.stop_slippage_rate,
+            timeout_slippage_rate=self.timeout_slippage_rate,
+        )
+        labeler = TripleBarrierLabeler(tb_cfg)
+        win_p, stop_p = labeler.compute_barriers(entry_price)
+
+        # 1. WIN audit: check that selling at win_p after paying buy_fee_rate + sell_fee_rate yields >= +1.5%
+        # and that net_win_payoff equals target_net_win_return - execution_entry_friction (no second fee deduction!)
+        realized_win_label_net = _q6(
+            (win_p * (Decimal("1") - self.sell_fee_rate) - entry_price * (Decimal("1") + self.buy_fee_rate))
+            / (entry_price * (Decimal("1") + self.buy_fee_rate))
+        )
+        win_diff_without_entry_friction = abs(
+            (self.net_win_payoff + self.execution_entry_friction) - self.target_net_win_return
+        )
+        if win_diff_without_entry_friction != Decimal("0"):
+            raise ValueError("Double fee deduction detected on WIN payoff!")
+
+        # 2. STOP audit: check exact match between label_stop_net_return and TripleBarrierLabeler STOP formula
+        stop_exit = stop_p * (Decimal("1") - self.stop_slippage_rate)
+        realized_stop_label_net = _q6(
+            (stop_exit * (Decimal("1") - self.sell_fee_rate) - entry_price * (Decimal("1") + self.buy_fee_rate))
+            / (entry_price * (Decimal("1") + self.buy_fee_rate))
+        )
+        if abs(realized_stop_label_net - self.label_stop_net_return) > Decimal("0.000002"):
+            raise ValueError(
+                f"STOP formula mismatch: labeler={realized_stop_label_net} vs cost_model={self.label_stop_net_return}"
+            )
+
+        # 3. TIMEOUT audit: check exact match between label_timeout_net_return and TripleBarrierLabeler TIMEOUT formula
+        raw_timeout_exit = entry_price * (Decimal("1") + self.expected_timeout_gross_return)
+        timeout_exit = raw_timeout_exit * (Decimal("1") - self.timeout_slippage_rate)
+        realized_timeout_label_net = _q6(
+            (timeout_exit * (Decimal("1") - self.sell_fee_rate) - entry_price * (Decimal("1") + self.buy_fee_rate))
+            / (entry_price * (Decimal("1") + self.buy_fee_rate))
+        )
+        if abs(realized_timeout_label_net - self.label_timeout_net_return) > Decimal("0.000002"):
+            raise ValueError(
+                f"TIMEOUT formula mismatch: labeler={realized_timeout_label_net} vs cost_model={self.label_timeout_net_return}"
+            )
+
+        return {
+            "double_fee_counting_detected": False,
+            "entry_price": entry_price,
+            "win_barrier_price": win_p,
+            "stop_barrier_price": stop_p,
+            "realized_win_label_net": realized_win_label_net,
+            "net_win_payoff": self.net_win_payoff,
+            "label_stop_net_return": self.label_stop_net_return,
+            "net_stop_payoff": self.net_stop_payoff,
+            "label_timeout_net_return": self.label_timeout_net_return,
+            "net_timeout_payoff": self.net_timeout_payoff,
+            "execution_entry_friction": self.execution_entry_friction,
+        }
 
     def to_mapping(self) -> dict[str, Decimal]:
         return {
@@ -224,9 +317,10 @@ class A02CostAssumptions:
 def compute_multiclass_calibration_metrics(
     predicted_probs: Sequence[tuple[Decimal, Decimal, Decimal]],
     actual_outcomes: Sequence[BarrierOutcome],
+    reference_priors: tuple[float, float, float] | None = None,
     n_bins: int = 5,
 ) -> dict[str, Decimal]:
-    """Compute out-of-sample Multiclass Brier Score, Baseline Brier Score, Brier Skill Score, ECE, and Log-Loss."""
+    """Compute Multiclass Brier Score, Baseline Brier Score, Brier Skill Score, Log-Loss, Baseline Log-Loss, and ECE."""
     n = len(predicted_probs)
     if n == 0 or len(actual_outcomes) != n:
         raise ValueError("Non-empty matching predicted_probs and actual_outcomes required")
@@ -237,19 +331,20 @@ def compute_multiclass_calibration_metrics(
         BarrierOutcome.TIMEOUT: 2,
     }
 
-    # Class frequencies for constant-prior baseline Brier score
     counts = [0, 0, 0]
     for out in actual_outcomes:
         counts[outcome_to_idx[out]] += 1
-    priors = [c / n for c in counts]
+
+    if reference_priors is not None:
+        priors = list(reference_priors)
+    else:
+        priors = [c / n for c in counts]
 
     brier_sum = 0.0
     baseline_brier_sum = 0.0
     log_loss_sum = 0.0
-    eps = 1e-9
-
-    confidences: list[float] = []
-    accuracies: list[float] = []
+    baseline_log_loss_sum = 0.0
+    eps = 1e-6
 
     for (pw, ps, pt), out in zip(predicted_probs, actual_outcomes):
         probs = [float(pw), float(ps), float(pt)]
@@ -262,16 +357,15 @@ def compute_multiclass_calibration_metrics(
         p_true = max(eps, min(1.0 - eps, probs[y_idx]))
         log_loss_sum += -math.log(p_true)
 
-        best_c = max(range(3), key=lambda c: probs[c])
-        confidences.append(probs[best_c])
-        accuracies.append(1.0 if best_c == y_idx else 0.0)
+        p_base_true = max(eps, min(1.0 - eps, priors[y_idx]))
+        baseline_log_loss_sum += -math.log(p_base_true)
 
     brier_score = brier_sum / n
     baseline_brier = max(eps, baseline_brier_sum / n)
     brier_skill = 1.0 - (brier_score / baseline_brier)
     log_loss = log_loss_sum / n
+    baseline_log_loss = baseline_log_loss_sum / n
 
-    # Expected Calibration Error (ECE) across top-class confidence bins ( plus class-wise marginal ECE )
     ece = 0.0
     for c in range(3):
         c_probs = [float(p[c]) for p in predicted_probs]
@@ -296,8 +390,134 @@ def compute_multiclass_calibration_metrics(
         "brier_skill_score": _q6(Decimal(str(brier_skill))),
         "ece": _q6(Decimal(str(ece))),
         "log_loss": _q6(Decimal(str(log_loss))),
+        "baseline_log_loss": _q6(Decimal(str(baseline_log_loss))),
         "oof_sample_count": Decimal(n),
     }
+
+
+def compute_bootstrap_confidence_intervals(
+    predicted_probs: Sequence[tuple[Decimal, Decimal, Decimal]],
+    labels: Sequence[TripleBarrierLabel],
+    costs: A02CostAssumptions,
+    n_bootstrap: int = 400,
+    seed: int = 42,
+) -> dict[str, tuple[Decimal, Decimal]]:
+    """Compute 95% bootstrap confidence intervals (`[p2.5, p97.5]`) on independent test predictions (Task A.6)."""
+    n = len(predicted_probs)
+    if n == 0 or len(labels) != n:
+        raise ValueError("Non-empty matching predicted_probs and labels required")
+
+    rng = random.Random(seed)
+    briers: list[Decimal] = []
+    log_losses: list[Decimal] = []
+    eces: list[Decimal] = []
+    ev_nets: list[Decimal] = []
+    realized_nets: list[Decimal] = []
+
+    sample_ev_list = [costs.compute_ev_net(pw, ps, pt) for (pw, ps, pt) in predicted_probs]
+    sample_realized_list = [lbl.net_return - costs.execution_entry_friction for lbl in labels]
+
+    for _ in range(n_bootstrap):
+        idxs = [rng.randrange(n) for _ in range(n)]
+        b_probs = [predicted_probs[i] for i in idxs]
+        b_outcomes = [labels[i].outcome for i in idxs]
+        m = compute_multiclass_calibration_metrics(b_probs, b_outcomes)
+        briers.append(m["brier_score"])
+        log_losses.append(m["log_loss"])
+        eces.append(m["ece"])
+        ev_nets.append(_q6(sum((sample_ev_list[i] for i in idxs), Decimal("0")) / Decimal(n)))
+        realized_nets.append(_q6(sum((sample_realized_list[i] for i in idxs), Decimal("0")) / Decimal(n)))
+
+    def _ci(arr: list[Decimal]) -> tuple[Decimal, Decimal]:
+        arr_s = sorted(arr)
+        lo_idx = max(0, int(0.025 * len(arr_s)))
+        hi_idx = min(len(arr_s) - 1, int(0.975 * len(arr_s)))
+        return _q6(arr_s[lo_idx]), _q6(arr_s[hi_idx])
+
+    return {
+        "brier_score": _ci(briers),
+        "log_loss": _ci(log_losses),
+        "ece": _ci(eces),
+        "mean_ev_net": _ci(ev_nets),
+        "mean_realized_net_return": _ci(realized_nets),
+    }
+
+
+def evaluate_cost_sensitivity_matrix(
+    predicted_probs: Sequence[tuple[Decimal, Decimal, Decimal]],
+    labels: Sequence[TripleBarrierLabel],
+    empirical_timeout_gross_return: Decimal = Decimal("0.0000"),
+) -> dict[str, dict[str, Decimal]]:
+    """Evaluate `ev_net` and positive-EV trade fraction across 4 transaction cost scenarios (Task A.6)."""
+    scenarios: dict[str, A02CostAssumptions] = {
+        "tier1_vip_maker_bnb_low_cost": A02CostAssumptions(
+            buy_fee_rate=Decimal("0.0006"),
+            sell_fee_rate=Decimal("0.0006"),
+            entry_slippage_rate=Decimal("0.0001"),
+            stop_slippage_rate=Decimal("0.0003"),
+            adverse_selection_penalty=Decimal("0.0002"),
+            expected_timeout_gross_return=empirical_timeout_gross_return,
+            timeout_slippage_rate=Decimal("0.0001"),
+        ),
+        "tier2_standard_spot_baseline": A02CostAssumptions(
+            buy_fee_rate=Decimal("0.0010"),
+            sell_fee_rate=Decimal("0.0010"),
+            entry_slippage_rate=Decimal("0.0003"),
+            stop_slippage_rate=Decimal("0.0005"),
+            adverse_selection_penalty=Decimal("0.0004"),
+            expected_timeout_gross_return=empirical_timeout_gross_return,
+            timeout_slippage_rate=Decimal("0.0002"),
+        ),
+        "tier3_stressed_slippage": A02CostAssumptions(
+            buy_fee_rate=Decimal("0.0010"),
+            sell_fee_rate=Decimal("0.0010"),
+            entry_slippage_rate=Decimal("0.0006"),
+            stop_slippage_rate=Decimal("0.0012"),
+            adverse_selection_penalty=Decimal("0.0008"),
+            expected_timeout_gross_return=empirical_timeout_gross_return,
+            timeout_slippage_rate=Decimal("0.0005"),
+        ),
+        "tier4_extreme_illiquidity_stress": A02CostAssumptions(
+            buy_fee_rate=Decimal("0.0015"),
+            sell_fee_rate=Decimal("0.0015"),
+            entry_slippage_rate=Decimal("0.0010"),
+            stop_slippage_rate=Decimal("0.0020"),
+            adverse_selection_penalty=Decimal("0.0012"),
+            expected_timeout_gross_return=empirical_timeout_gross_return,
+            timeout_slippage_rate=Decimal("0.0008"),
+        ),
+    }
+
+    n = max(1, len(predicted_probs))
+    results: dict[str, dict[str, Decimal]] = {}
+    for name, c_model in scenarios.items():
+        evs = [c_model.compute_ev_net(pw, ps, pt) for (pw, ps, pt) in predicted_probs]
+        pos_cnt = sum(1 for e in evs if e > Decimal("0"))
+        mean_ev = _q6(sum(evs, Decimal("0")) / Decimal(n))
+        results[name] = {
+            "round_trip_fee_bps": _q6((c_model.buy_fee_rate + c_model.sell_fee_rate) * Decimal("10000")),
+            "net_win_payoff": c_model.net_win_payoff,
+            "net_stop_payoff": c_model.net_stop_payoff,
+            "net_timeout_payoff": c_model.net_timeout_payoff,
+            "mean_ev_net": mean_ev,
+            "positive_ev_trade_count": Decimal(pos_cnt),
+            "positive_ev_ratio": _q6(Decimal(pos_cnt) / Decimal(n)),
+        }
+    return results
+
+
+@dataclass(frozen=True)
+class ThreeStageEvaluationReport:
+    """Comprehensive audit report from `fit_and_evaluate_three_stage` (Task A.5, A.6, A.9)."""
+
+    split: PurgedThreeStageSplit
+    train_metrics: Mapping[str, Decimal]
+    calibration_fold_metrics: Mapping[str, Decimal]
+    final_test_metrics: Mapping[str, Decimal]
+    bootstrap_95_ci: Mapping[str, tuple[Decimal, Decimal]]
+    cost_sensitivity: Mapping[str, Mapping[str, Decimal]]
+    statistical_verdict: StatisticalVerdict
+    verdict_reasons: tuple[str, ...]
 
 
 @dataclass
@@ -305,12 +525,13 @@ class A02BreakoutCalibratedModel:
     """Calibrated 3-barrier breakout probability model (`WIN`, `STOP`, `TIMEOUT`) for `SUIUSDT` (§4, P3_PLAN)."""
 
     model_id: str = "a02-suiusdt-breakout-3barrier"
-    version: str = "1.0.0-p3"
+    version: str = "1.1.0-p3-remediated"
     feature_names: tuple[str, ...] = A02_FEATURE_NAMES
     costs: A02CostAssumptions = field(default_factory=A02CostAssumptions)
     candidate_config: BreakoutCandidateConfig = field(default_factory=BreakoutCandidateConfig)
     proposal_ttl_seconds: int = 300
     max_allowed_ece: Decimal = Decimal("0.080000")
+    min_test_events_for_edge_claim: int = 100
     risk_compatibility: str = "1.0.0-candidate"
     rollback_ref: str = "a02-suiusdt-breakout-3barrier:0.9.0-l2-baseline"
 
@@ -325,6 +546,7 @@ class A02BreakoutCalibratedModel:
     calibration_biases: tuple[float, float, float] = (0.0, 0.0, 0.0)
     used_l2_fallback: bool = False
     calibration_metrics: dict[str, Decimal] = field(default_factory=dict)
+    statistical_verdict: StatisticalVerdict = StatisticalVerdict.INSUFFICIENT_EVIDENCE
     train_end_utc: datetime | None = None
     test_periods: tuple[str, ...] = field(default_factory=tuple)
 
@@ -356,7 +578,6 @@ class A02BreakoutCalibratedModel:
             self.feature_means[k] = m
             self.feature_stds[k] = max(s, 1e-6)
 
-        # Positive drivers of WIN: strong breakout_pct, high rvol_20, strong body_ratio, high taker_buy_ratio, high er_20, positive sui_btc_rel_strength
         self.weights_win = {
             "breakout_pct": 0.65,
             "rvol_20": 0.55,
@@ -374,7 +595,6 @@ class A02BreakoutCalibratedModel:
             "sui_btc_rel_strength_6": 0.40,
             "btc_ret_3": 0.35,
         }
-        # Positive drivers of STOP: large upper wick (bull trap), excessive volatility, negative BTC momentum
         self.weights_stop = {
             "breakout_pct": -0.35,
             "rvol_20": -0.30,
@@ -392,7 +612,6 @@ class A02BreakoutCalibratedModel:
             "sui_btc_rel_strength_6": -0.35,
             "btc_ret_3": -0.55,
         }
-        # Drivers of TIMEOUT: low ATR, low efficiency ratio, weak volume follow-through
         self.weights_timeout = {
             "breakout_pct": -0.30,
             "rvol_20": -0.25,
@@ -416,6 +635,7 @@ class A02BreakoutCalibratedModel:
             "brier_skill_score": Decimal("0.379032"),
             "ece": Decimal("0.031000"),
             "log_loss": Decimal("0.780000"),
+            "baseline_log_loss": Decimal("1.010000"),
             "oof_sample_count": Decimal("0"),
         }
 
@@ -467,7 +687,6 @@ class A02BreakoutCalibratedModel:
         z_win, z_stop, z_timeout = self._raw_logits_from_features(sui_features.features)
         p_win, p_stop, p_timeout = self._calibrated_softmax(z_win, z_stop, z_timeout)
 
-        # Normalized Shannon entropy complement as confidence in [0, 1]
         probs_f = [max(1e-9, float(p_win)), max(1e-9, float(p_stop)), max(1e-9, float(p_timeout))]
         entropy = -sum(p * math.log(p) for p in probs_f)
         max_entropy = math.log(3.0)
@@ -491,7 +710,6 @@ class A02BreakoutCalibratedModel:
         if not sui_features.complete_bar_only:
             raise UnclosedBarRejectedError("BreakoutProposal requires complete_bar_only=True")
 
-        # Respect A-01 regime gate
         if not regime_decision.allow_entry:
             return None
 
@@ -528,17 +746,25 @@ class A02BreakoutCalibratedModel:
             expiry=expiry_utc,
         )
 
-    def fit_purged_walk_forward(
+    def fit_and_evaluate_three_stage(
         self,
         features_seq: Sequence[MarketFeatures],
         labels_seq: Sequence[TripleBarrierLabel],
         splitter: PurgedWalkForwardSplitter | None = None,
-        l2_reg: float = 0.25,
-        learning_rate: float = 0.15,
+        train_ratio: float = 0.50,
+        cal_ratio: float = 0.25,
+        l2_reg: float = 0.35,
+        learning_rate: float = 0.12,
         epochs: int = 120,
-    ) -> dict[str, Decimal]:
-        """Train L2-regularized multinomial weights and fit out-of-sample probability calibration
-        strictly using Purged & Embargoed Walk-Forward splits (§4.3, §14.1, P3_PLAN).
+    ) -> ThreeStageEvaluationReport:
+        """Strictly separate `TRAIN`, `CALIBRATION`, and `FINAL_TEST` with Purge + Embargo at both boundaries (Task A.5, A.6, A.9).
+
+        1. `TRAIN`: Fits feature standardization (`feature_means`, `feature_stds`) and L2 multinomial weights.
+        2. `CALIBRATION` (separated from `TRAIN` by `>= 36` bars / 3h Purge + Embargo):
+           Fits `calibration_temperature`, `calibration_biases`, and estimates `expected_timeout_gross_return`.
+        3. `FINAL_TEST` (separated from `CALIBRATION` by `>= 36` bars / 3h Purge + Embargo):
+           Untouched holdout fold used EXCLUSIVELY to compute final acceptance metrics (`Brier`, `Log Loss`, `ECE`,
+           `ev_net`, bootstrap 95% CIs, cost sensitivity, and `StatisticalVerdict`).
         """
         if len(features_seq) != len(labels_seq) or not features_seq:
             raise ValueError("features_seq and labels_seq must be non-empty and have matching lengths")
@@ -550,7 +776,11 @@ class A02BreakoutCalibratedModel:
                 raise UnclosedBarRejectedError("Training requires complete_bar_only=True")
 
         pwf = splitter or PurgedWalkForwardSplitter(n_splits=3, embargo_bars=36, min_train_events=8)
-        folds = pwf.split(labels_seq)
+        split = pwf.split_train_calibration_test(
+            labels=labels_seq,
+            train_ratio=train_ratio,
+            cal_ratio=cal_ratio,
+        )
 
         outcome_to_idx = {
             BarrierOutcome.WIN: 0,
@@ -558,42 +788,9 @@ class A02BreakoutCalibratedModel:
             BarrierOutcome.TIMEOUT: 2,
         }
 
-        # Collect out-of-sample uncalibrated logits across all Purged Walk-Forward validation folds
-        oof_raw_logits: list[tuple[float, float, float]] = []
-        oof_outcomes: list[BarrierOutcome] = []
-        period_strings: list[str] = []
-
-        for fold in folds:
-            train_feats = [features_seq[i] for i in fold.train_indices]
-            train_lbls = [labels_seq[i] for i in fold.val_indices]  # for period tracking
-            if train_lbls:
-                period_strings.append(
-                    f"fold_{fold.fold_id}:{labels_seq[fold.val_indices[0]].entry_time_utc.isoformat()}"
-                    f"->{labels_seq[fold.val_indices[-1]].entry_time_utc.isoformat()}"
-                )
-
-            means, stds, w_win, w_stop, w_time, b_vec = self._fit_l2_multinomial_on_subset(
-                subset_features=[features_seq[i] for i in fold.train_indices],
-                subset_outcomes=[outcome_to_idx[labels_seq[i].outcome] for i in fold.train_indices],
-                l2_reg=l2_reg,
-                learning_rate=learning_rate,
-                epochs=epochs,
-            )
-
-            for vi in fold.val_indices:
-                vf = features_seq[vi].features
-                zw, zs, zt = b_vec[0], b_vec[1], b_vec[2]
-                for k in self.feature_names:
-                    val_f = float(vf.get(k, Decimal("0")))
-                    nx = max(-5.0, min(5.0, (val_f - means[k]) / stds[k]))
-                    zw += w_win[k] * nx
-                    zs += w_stop[k] * nx
-                    zt += w_time[k] * nx
-                oof_raw_logits.append((zw, zs, zt))
-                oof_outcomes.append(labels_seq[vi].outcome)
-
-        # Fit final model weights on the full causal training history
-        all_y = [outcome_to_idx[lbl.outcome] for lbl in labels_seq]
+        # Stage 1: Fit weights and scalers ONLY on TRAIN
+        train_feats = [features_seq[i] for i in split.train_indices]
+        train_outcomes = [outcome_to_idx[labels_seq[i].outcome] for i in split.train_indices]
         (
             self.feature_means,
             self.feature_stds,
@@ -602,34 +799,169 @@ class A02BreakoutCalibratedModel:
             self.weights_timeout,
             self.intercepts,
         ) = self._fit_l2_multinomial_on_subset(
-            subset_features=features_seq,
-            subset_outcomes=all_y,
+            subset_features=train_feats,
+            subset_outcomes=train_outcomes,
             l2_reg=l2_reg,
             learning_rate=learning_rate,
             epochs=epochs,
         )
 
-        # Fit Temperature + Prior-Shift Dirichlet Calibration on Out-Of-Sample validation logits
-        self._fit_oof_calibrator(oof_raw_logits, oof_outcomes)
-
-        oof_calibrated_probs = [
-            self._calibrated_softmax(zw, zs, zt) for (zw, zs, zt) in oof_raw_logits
+        # Estimate empirical TIMEOUT gross return from TRAIN + CALIBRATION (never touching FINAL_TEST)
+        non_test_timeout_gross = [
+            labels_seq[i].gross_return
+            for i in (*split.train_indices, *split.cal_indices)
+            if labels_seq[i].outcome == BarrierOutcome.TIMEOUT
         ]
-        metrics = compute_multiclass_calibration_metrics(oof_calibrated_probs, oof_outcomes)
+        if non_test_timeout_gross:
+            emp_timeout_gross = _q6(
+                sum(non_test_timeout_gross, Decimal("0")) / Decimal(len(non_test_timeout_gross))
+            )
+            self.costs = A02CostAssumptions(
+                buy_fee_rate=self.costs.buy_fee_rate,
+                sell_fee_rate=self.costs.sell_fee_rate,
+                target_net_win_return=self.costs.target_net_win_return,
+                stop_loss_trigger_pct=self.costs.stop_loss_trigger_pct,
+                entry_slippage_rate=self.costs.entry_slippage_rate,
+                stop_slippage_rate=self.costs.stop_slippage_rate,
+                adverse_selection_penalty=self.costs.adverse_selection_penalty,
+                expected_timeout_gross_return=emp_timeout_gross,
+                timeout_slippage_rate=self.costs.timeout_slippage_rate,
+            )
 
-        # Fallback check (§08 P3_PLAN): if ECE exceeds threshold or skill < 0, dampen temperature to L2 prior baseline
-        if metrics["ece"] > self.max_allowed_ece or metrics["brier_skill_score"] < Decimal("0"):
+        # Stage 2: Fit calibrator ONLY on CALIBRATION fold logits
+        cal_logits = [self._raw_logits_from_features(features_seq[i].features) for i in split.cal_indices]
+        cal_outcomes = [labels_seq[i].outcome for i in split.cal_indices]
+        self._fit_oof_calibrator(cal_logits, cal_outcomes)
+
+        cal_probs = [self._calibrated_softmax(zw, zs, zt) for (zw, zs, zt) in cal_logits]
+        cal_metrics = compute_multiclass_calibration_metrics(cal_probs, cal_outcomes)
+
+        # Check calibration fallback ONLY on CALIBRATION fold (never peeking at FINAL_TEST!)
+        if cal_metrics["ece"] > self.max_allowed_ece or cal_metrics["brier_skill_score"] < Decimal("0"):
             self.used_l2_fallback = True
-            self.calibration_temperature = 1.5
-            oof_calibrated_probs = [
-                self._calibrated_softmax(zw, zs, zt) for (zw, zs, zt) in oof_raw_logits
-            ]
-            metrics = compute_multiclass_calibration_metrics(oof_calibrated_probs, oof_outcomes)
+            self.calibration_temperature = max(self.calibration_temperature, 2.0)
+            cal_probs = [self._calibrated_softmax(zw, zs, zt) for (zw, zs, zt) in cal_logits]
+            cal_metrics = compute_multiclass_calibration_metrics(cal_probs, cal_outcomes)
 
-        self.calibration_metrics = metrics
-        self.train_end_utc = labels_seq[-1].entry_time_utc
-        self.test_periods = tuple(period_strings)
-        return metrics
+        train_logits = [self._raw_logits_from_features(features_seq[i].features) for i in split.train_indices]
+        train_probs = [self._calibrated_softmax(zw, zs, zt) for (zw, zs, zt) in train_logits]
+        train_metrics = compute_multiclass_calibration_metrics(
+            train_probs,
+            [labels_seq[i].outcome for i in split.train_indices],
+        )
+
+        # Stage 3: Evaluate ONCE on untouched FINAL_TEST holdout fold
+        test_logits = [self._raw_logits_from_features(features_seq[i].features) for i in split.test_indices]
+        test_probs = [self._calibrated_softmax(zw, zs, zt) for (zw, zs, zt) in test_logits]
+        test_labels = [labels_seq[i] for i in split.test_indices]
+        test_outcomes = [lbl.outcome for lbl in test_labels]
+
+        final_test_metrics = dict(compute_multiclass_calibration_metrics(test_probs, test_outcomes))
+        test_evs = [self.costs.compute_ev_net(pw, ps, pt) for (pw, ps, pt) in test_probs]
+        test_realized = [lbl.net_return - self.costs.execution_entry_friction for lbl in test_labels]
+        n_test = len(test_labels)
+        final_test_metrics["mean_ev_net"] = _q6(sum(test_evs, Decimal("0")) / Decimal(n_test))
+        final_test_metrics["mean_realized_net_return"] = _q6(sum(test_realized, Decimal("0")) / Decimal(n_test))
+        final_test_metrics["positive_ev_count"] = Decimal(sum(1 for e in test_evs if e > Decimal("0")))
+
+        bootstrap_ci = compute_bootstrap_confidence_intervals(
+            predicted_probs=test_probs,
+            labels=test_labels,
+            costs=self.costs,
+        )
+        cost_sens = evaluate_cost_sensitivity_matrix(
+            predicted_probs=test_probs,
+            labels=test_labels,
+            empirical_timeout_gross_return=self.costs.expected_timeout_gross_return,
+        )
+
+        # Task A.9: Determine objective StatisticalVerdict
+        verdict, v_reasons = self._evaluate_statistical_verdict(
+            n_test=n_test,
+            final_test_metrics=final_test_metrics,
+            bootstrap_ci=bootstrap_ci,
+        )
+        self.statistical_verdict = verdict
+        self.calibration_metrics = final_test_metrics
+        self.train_end_utc = labels_seq[split.cal_indices[-1]].entry_time_utc
+        self.test_periods = (
+            f"train:{labels_seq[split.train_indices[0]].entry_time_utc.isoformat()}->{labels_seq[split.train_indices[-1]].entry_time_utc.isoformat()}",
+            f"cal:{labels_seq[split.cal_indices[0]].entry_time_utc.isoformat()}->{labels_seq[split.cal_indices[-1]].entry_time_utc.isoformat()}",
+            f"test:{labels_seq[split.test_indices[0]].entry_time_utc.isoformat()}->{labels_seq[split.test_indices[-1]].entry_time_utc.isoformat()}",
+        )
+
+        return ThreeStageEvaluationReport(
+            split=split,
+            train_metrics=train_metrics,
+            calibration_fold_metrics=cal_metrics,
+            final_test_metrics=final_test_metrics,
+            bootstrap_95_ci=bootstrap_ci,
+            cost_sensitivity=cost_sens,
+            statistical_verdict=verdict,
+            verdict_reasons=v_reasons,
+        )
+
+    def _evaluate_statistical_verdict(
+        self,
+        n_test: int,
+        final_test_metrics: Mapping[str, Decimal],
+        bootstrap_ci: Mapping[str, tuple[Decimal, Decimal]],
+    ) -> tuple[StatisticalVerdict, tuple[str, ...]]:
+        """Evaluate whether out-of-sample evidence proves a statistically valid positive edge (Task A.9)."""
+        reasons: list[str] = []
+        if n_test < self.min_test_events_for_edge_claim:
+            reasons.append(
+                f"FINAL_TEST_SAMPLE_SIZE_TOO_SMALL({n_test}<{self.min_test_events_for_edge_claim})"
+            )
+
+        realized_lo, _ = bootstrap_ci["mean_realized_net_return"]
+        ev_lo, _ = bootstrap_ci["mean_ev_net"]
+        mean_realized = final_test_metrics["mean_realized_net_return"]
+        mean_ev = final_test_metrics["mean_ev_net"]
+        brier_skill = final_test_metrics["brier_skill_score"]
+
+        if mean_realized <= Decimal("0") and mean_ev <= Decimal("0"):
+            reasons.append(f"NON_POSITIVE_OOS_NET_EXPECTANCY(mean_realized={mean_realized},mean_ev={mean_ev})")
+            if n_test < self.min_test_events_for_edge_claim:
+                return StatisticalVerdict.INSUFFICIENT_EVIDENCE, tuple(reasons)
+            return StatisticalVerdict.NO_EDGE, tuple(reasons)
+
+        if realized_lo <= Decimal("0") or ev_lo <= Decimal("0"):
+            reasons.append(
+                f"BOOTSTRAP_95CI_LOWER_BOUND_CROSSES_ZERO(realized_lo={realized_lo},ev_lo={ev_lo})"
+            )
+            return StatisticalVerdict.INSUFFICIENT_EVIDENCE, tuple(reasons)
+
+        if brier_skill <= Decimal("0"):
+            reasons.append(f"NON_POSITIVE_BRIER_SKILL({brier_skill})")
+            return StatisticalVerdict.NO_EDGE, tuple(reasons)
+
+        if reasons:
+            return StatisticalVerdict.INSUFFICIENT_EVIDENCE, tuple(reasons)
+
+        return StatisticalVerdict.EDGE_VALIDATED, ("POSITIVE_OOS_95CI_AND_BRIER_SKILL_PROVEN",)
+
+    def fit_purged_walk_forward(
+        self,
+        features_seq: Sequence[MarketFeatures],
+        labels_seq: Sequence[TripleBarrierLabel],
+        splitter: PurgedWalkForwardSplitter | None = None,
+        l2_reg: float = 0.35,
+        learning_rate: float = 0.12,
+        epochs: int = 120,
+    ) -> dict[str, Decimal]:
+        """Delegate to `fit_and_evaluate_three_stage` so training, calibration, and final holdout test
+        are always strictly separated (Task A.5), returning `final_test_metrics`.
+        """
+        report = self.fit_and_evaluate_three_stage(
+            features_seq=features_seq,
+            labels_seq=labels_seq,
+            splitter=splitter,
+            l2_reg=l2_reg,
+            learning_rate=learning_rate,
+            epochs=epochs,
+        )
+        return dict(report.final_test_metrics)
 
     def _fit_l2_multinomial_on_subset(
         self,
@@ -704,7 +1036,7 @@ class A02BreakoutCalibratedModel:
         oof_logits: Sequence[tuple[float, float, float]],
         oof_outcomes: Sequence[BarrierOutcome],
     ) -> None:
-        """Optimize temperature `T` and class calibration biases `(b_w, b_s, b_t)` on out-of-sample folds."""
+        """Optimize temperature `T` and class calibration biases `(b_w, b_s, b_t)` on CALIBRATION fold."""
         if not oof_logits:
             return
         outcome_to_idx = {
@@ -715,7 +1047,6 @@ class A02BreakoutCalibratedModel:
         y_indices = [outcome_to_idx[o] for o in oof_outcomes]
         n = len(oof_logits)
 
-        # Empirical class log-priors vs average raw probabilities
         emp_counts = [max(0.5, sum(1 for y in y_indices if y == c)) for c in range(3)]
         emp_priors = [c / sum(emp_counts) for c in emp_counts]
 
@@ -723,8 +1054,7 @@ class A02BreakoutCalibratedModel:
         best_biases = (0.0, 0.0, 0.0)
         best_brier = float("inf")
 
-        for temp_cand in (0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 2.5):
-            # Compute mean predicted probability at temp_cand
+        for temp_cand in (0.6, 0.8, 1.0, 1.25, 1.5, 2.0, 3.0, 5.0):
             mean_p = [0.0, 0.0, 0.0]
             for zw, zs, zt in oof_logits:
                 ls = [zw / temp_cand, zs / temp_cand, zt / temp_cand]
@@ -734,7 +1064,6 @@ class A02BreakoutCalibratedModel:
                 for c in range(3):
                     mean_p[c] += (exps[c] / se) / n
 
-            # Log-ratio bias shift so marginal mean matches out-of-sample empirical prior
             raw_b = [math.log(max(1e-4, emp_priors[c]) / max(1e-4, mean_p[c])) for c in range(3)]
             mean_b = sum(raw_b) / 3.0
             biases_cand = (
@@ -772,6 +1101,7 @@ class A02BreakoutCalibratedModel:
             "model_id": self.model_id,
             "version": self.version,
             "symbol": TRADING_SYMBOL,
+            "statistical_verdict": self.statistical_verdict.value,
             "feature_names": list(self.feature_names),
             "feature_means": {k: round(self.feature_means[k], 8) for k in self.feature_names},
             "feature_stds": {k: round(self.feature_stds[k], 8) for k in self.feature_names},

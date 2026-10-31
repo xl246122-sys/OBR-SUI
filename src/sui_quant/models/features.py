@@ -1,4 +1,4 @@
-"""Causal, zero-lookahead-leak multi-horizon feature extraction pipeline (§2.1, §3, §4, §14.1, P3_PLAN).
+"""Causal, zero-lookahead-leak multi-horizon feature extraction pipeline (§2.1, §3, §4, §14.1, P3_PLAN, Task A.7 & A.8).
 
 Enforces:
 1. Physical rejection of unclosed K-lines (`is_closed=False` / `UnclosedKlineTransientView` /
@@ -6,8 +6,18 @@ Enforces:
 2. Strict causal windowing: at bar `t`, rolling reference levels (`prev_20_high`, `prev_20_low`,
    `prev_20_mean_vol`, `prev_20_std_vol`) use ONLY closed bars `[t-20 .. t-1]`, and cross-asset
    `BTCUSDT` or higher-horizon `15m`/`1h` bars are filtered strictly by `close_time_ms <= bar_t.close_time_ms`.
-3. Deterministic `compute_feature_snapshot_hash` and built-in `verify_causality_no_lookahead` self-audit
-   proving that mutating or truncating future bars `t+1 .. t+N` produces 0% change in `MarketFeatures` at `t`.
+3. Task A.8 Higher-Timeframe (`15m` / `1h`) Strict Closed-Bar Alignment:
+   - Explicitly validates that any `15m` (`900,000 ms`) or `1h` (`3,600,000 ms`) bar has `is_closed=True`,
+     `close_time_ms <= bar_t.close_time_ms`, and full interval span.
+   - When `sui_15m_bars` / `sui_1h_bars` are derived from `5m` bars, aggregates ONLY up to the most recent
+     completed calendar `15m` (`:00, :15, :30, :45`) or `1h` (`:00`) boundary `<= bar_t.close_time_ms + 1`,
+     guaranteeing that at e.g. `10:10`, the in-progress `10:00..10:15` 15m bar and `10:00..11:00` 1h bar
+     are never referenced.
+4. Task A.7 Explicit BTC Flash-Drop Time Windows:
+   - `btc_ret_5m` (1 closed 5m bar = 5-minute window `[t-5m, t]`, threshold `-0.80%`)
+   - `btc_ret_15m` (3 closed 5m bars = 15-minute window `[t-15m, t]`, threshold `-1.50%`)
+   - `btc_ret_30m` (6 closed 5m bars = 30-minute window `[t-30m, t]`, threshold `-2.20%`)
+5. Deterministic `compute_feature_snapshot_hash` and built-in `verify_causality_no_lookahead` self-audit.
 """
 
 from __future__ import annotations
@@ -34,6 +44,10 @@ from sui_quant.utils.clock import ensure_utc
 QUANT_8 = Decimal("0.00000001")
 EPSILON = Decimal("0.00000001")
 MIN_BREAKOUT_LOOKBACK_BARS = 20
+
+FIVE_MIN_MS = 5 * 60 * 1000       # 300,000 ms
+FIFTEEN_MIN_MS = 15 * 60 * 1000   # 900,000 ms
+ONE_HOUR_MS = 60 * 60 * 1000      # 3,600,000 ms
 
 
 class UnclosedBarRejectedError(ValueError):
@@ -86,7 +100,7 @@ def compute_features_schema_hash(feature_names: Sequence[str]) -> str:
     return hashlib.sha256(canonical).hexdigest()
 
 
-def _validate_closed_bar_sequence(bars: Sequence[ Any ], symbol: str) -> list[ClosedKlineBar]:
+def _validate_closed_bar_sequence(bars: Sequence[Any], symbol: str) -> list[ClosedKlineBar]:
     """Ensure all bars are `ClosedKlineBar` with `is_closed=True` for `symbol` and strictly ordered in time."""
     if not bars:
         raise ValueError(f"Empty bar sequence for {symbol}")
@@ -103,6 +117,10 @@ def _validate_closed_bar_sequence(bars: Sequence[ Any ], symbol: str) -> list[Cl
             )
         if bar.symbol != symbol:
             raise ValueError(f"Expected bar symbol '{symbol}', got '{bar.symbol}' at index {idx}")
+        if bar.close_time_ms <= bar.open_time_ms:
+            raise CausalityViolationError(
+                f"Invalid bar timestamps at index {idx}: close_time_ms ({bar.close_time_ms}) <= open_time_ms ({bar.open_time_ms})"
+            )
         if prev_open_ms is not None and bar.open_time_ms <= prev_open_ms:
             raise CausalityViolationError(
                 f"Non-monotonic bar open_time_ms at index {idx}: {bar.open_time_ms} <= {prev_open_ms}"
@@ -162,6 +180,76 @@ def _decimal_pearson_corr(xs: Sequence[Decimal], ys: Sequence[Decimal]) -> Decim
     return corr
 
 
+def _extract_strict_htf_return(
+    explicit_htf_bars: Sequence[ClosedKlineBar] | None,
+    causal_5m_bars: Sequence[ClosedKlineBar],
+    decision_close_time_ms: int,
+    interval_ms: int,
+    bars_per_htf: int,
+) -> tuple[Decimal, int]:
+    """Compute the latest strictly completed higher-timeframe (`15m` or `1h`) 1-bar return and its `close_time_ms` (Task A.8).
+
+    Guarantees:
+    1. If `explicit_htf_bars` are provided, only bars with `b.is_closed == True`, full interval duration,
+       and `b.close_time_ms <= decision_close_time_ms` are eligible. Any bar that closes after
+       `decision_close_time_ms` (even if its `open_time_ms <= decision_close_time_ms`) is strictly excluded!
+    2. If `explicit_htf_bars` are not provided, finds the latest calendar boundary `B <= decision_close_time_ms + 1`
+       that is an exact multiple of `interval_ms` (e.g. `:00, :15, :30, :45` for `15m`; `:00` for `1h`),
+       and computes the return of the completed HTF candle ending at `B - 1` relative to the previous completed
+       HTF candle ending at `B - interval_ms - 1`.
+    """
+    if explicit_htf_bars:
+        all_htf = _validate_closed_bar_sequence(explicit_htf_bars, TRADING_SYMBOL)
+        eligible: list[ClosedKlineBar] = []
+        for b in all_htf:
+            span_ms = b.close_time_ms - b.open_time_ms + 1
+            if span_ms < interval_ms - 1000:
+                raise CausalityViolationError(
+                    f"HTF bar at open_time_ms={b.open_time_ms} has incomplete duration {span_ms}ms < {interval_ms}ms"
+                )
+            if b.close_time_ms <= decision_close_time_ms:
+                eligible.append(b)
+        if len(eligible) >= 2:
+            ret = (eligible[-1].close_price - eligible[-2].close_price) / max(
+                eligible[-2].close_price, EPSILON
+            )
+            return ret, eligible[-1].close_time_ms
+        if len(eligible) == 1:
+            ret = (eligible[0].close_price - eligible[0].open_price) / max(
+                eligible[0].open_price, EPSILON
+            )
+            return ret, eligible[0].close_time_ms
+        return Decimal("0"), 0
+
+    # Derive strictly from calendar-aligned completed HTF boundaries within `causal_5m_bars`
+    boundary_end_ms = ((decision_close_time_ms + 1) // interval_ms) * interval_ms
+    target_htf_close_ms = boundary_end_ms - 1
+
+    # Find the 5m bar in causal_5m_bars that closed at or immediately before target_htf_close_ms
+    aligned_idx: int | None = None
+    for idx in range(len(causal_5m_bars) - 1, -1, -1):
+        if causal_5m_bars[idx].close_time_ms <= target_htf_close_ms:
+            aligned_idx = idx
+            break
+
+    if aligned_idx is None:
+        return Decimal("0"), 0
+
+    aligned_close_ms = causal_5m_bars[aligned_idx].close_time_ms
+    if aligned_close_ms > decision_close_time_ms:
+        raise CausalityViolationError("HTF aligned close_time_ms exceeded decision_close_time_ms")
+
+    prev_idx = aligned_idx - bars_per_htf
+    if prev_idx >= 0:
+        p_now = causal_5m_bars[aligned_idx].close_price
+        p_prev = max(causal_5m_bars[prev_idx].close_price, EPSILON)
+        return (p_now - p_prev) / p_prev, aligned_close_ms
+
+    p_now = causal_5m_bars[aligned_idx].close_price
+    p_open = max(causal_5m_bars[0].open_price, EPSILON)
+    return (p_now - p_open) / p_open, aligned_close_ms
+
+
 STANDARD_MODEL_FEATURE_NAMES: tuple[str, ...] = (
     "open",
     "high",
@@ -198,10 +286,15 @@ STANDARD_MODEL_FEATURE_NAMES: tuple[str, ...] = (
     "ema_spread_pct",
     "ret_15m_1",
     "ret_1h_1",
+    "htf_15m_close_time_ms",
+    "htf_1h_close_time_ms",
     "btc_ret_1",
     "btc_ret_3",
     "btc_ret_6",
     "btc_ret_12",
+    "btc_ret_5m",
+    "btc_ret_15m",
+    "btc_ret_30m",
     "btc_atr_14_pct",
     "sui_btc_rel_strength_6",
     "btc_sui_corr_20",
@@ -211,15 +304,15 @@ STANDARD_MODEL_FEATURE_NAMES: tuple[str, ...] = (
 
 @dataclass(frozen=True)
 class FeaturePipelineConfig:
-    """Configuration for causal multi-horizon feature extraction."""
+    """Configuration for causal multi-horizon feature extraction (Task A.7 explicit windows)."""
 
     breakout_lookback: int = MIN_BREAKOUT_LOOKBACK_BARS
     atr_period: int = 14
     ema_fast_span: int = 9
     ema_slow_span: int = 20
-    btc_flash_drop_1bar: Decimal = Decimal("-0.0080")   # -0.8% in a single 5m bar
-    btc_flash_drop_3bar: Decimal = Decimal("-0.0150")   # -1.5% over 15m (3 bars)
-    btc_flash_drop_6bar: Decimal = Decimal("-0.0220")   # -2.2% over 30m (6 bars)
+    btc_flash_drop_1bar: Decimal = Decimal("-0.0080")   # 5m window (1 * 5m bar): <= -0.80%
+    btc_flash_drop_3bar: Decimal = Decimal("-0.0150")   # 15m window (3 * 5m bars): <= -1.50%
+    btc_flash_drop_6bar: Decimal = Decimal("-0.0220")   # 30m window (6 * 5m bars): <= -2.20%
     data_version: str = "v1.0-p3-causal-features"
 
 
@@ -336,28 +429,25 @@ class FeaturePipeline:
         ema_slow_20 = _decimal_ema(ema_window, self.config.ema_slow_span)
         ema_spread_pct = (ema_fast_9 - ema_slow_20) / max(ema_slow_20, EPSILON)
 
-        # 6. Higher-timeframe causal alignment (15m / 1h closed bars with close_time_ms <= bar_t.close_time_ms)
-        ret_15m_1 = ret_3
-        if sui_15m_bars:
-            valid_15m = [
-                b for b in _validate_closed_bar_sequence(sui_15m_bars, TRADING_SYMBOL)
-                if b.close_time_ms <= bar_t.close_time_ms
-            ]
-            if len(valid_15m) >= 2:
-                ret_15m_1 = (valid_15m[-1].close_price - valid_15m[-2].close_price) / max(
-                    valid_15m[-2].close_price, EPSILON
-                )
-
-        ret_1h_1 = ret_12
-        if sui_1h_bars:
-            valid_1h = [
-                b for b in _validate_closed_bar_sequence(sui_1h_bars, TRADING_SYMBOL)
-                if b.close_time_ms <= bar_t.close_time_ms
-            ]
-            if len(valid_1h) >= 2:
-                ret_1h_1 = (valid_1h[-1].close_price - valid_1h[-2].close_price) / max(
-                    valid_1h[-2].close_price, EPSILON
-                )
+        # 6. Higher-timeframe causal alignment (Task A.8: strictly completed 15m and 1h bars with close_time_ms <= bar_t.close_time_ms)
+        ret_15m_1, htf_15m_close_ms = _extract_strict_htf_return(
+            explicit_htf_bars=sui_15m_bars,
+            causal_5m_bars=causal_sui,
+            decision_close_time_ms=bar_t.close_time_ms,
+            interval_ms=FIFTEEN_MIN_MS,
+            bars_per_htf=3,
+        )
+        ret_1h_1, htf_1h_close_ms = _extract_strict_htf_return(
+            explicit_htf_bars=sui_1h_bars,
+            causal_5m_bars=causal_sui,
+            decision_close_time_ms=bar_t.close_time_ms,
+            interval_ms=ONE_HOUR_MS,
+            bars_per_htf=12,
+        )
+        if htf_15m_close_ms > bar_t.close_time_ms or htf_1h_close_ms > bar_t.close_time_ms:
+            raise CausalityViolationError(
+                f"HTF close_time_ms ({htf_15m_close_ms}, {htf_1h_close_ms}) exceeded decision bar close ({bar_t.close_time_ms})"
+            )
 
         # 7. Cross-asset BTCUSDT reference features (strictly causal: close_time_ms <= bar_t.close_time_ms)
         btc_ret_1 = Decimal("0")
@@ -450,10 +540,15 @@ class FeaturePipeline:
             "ema_spread_pct": _q8(ema_spread_pct),
             "ret_15m_1": _q8(ret_15m_1),
             "ret_1h_1": _q8(ret_1h_1),
+            "htf_15m_close_time_ms": Decimal(htf_15m_close_ms),
+            "htf_1h_close_time_ms": Decimal(htf_1h_close_ms),
             "btc_ret_1": _q8(btc_ret_1),
             "btc_ret_3": _q8(btc_ret_3),
             "btc_ret_6": _q8(btc_ret_6),
             "btc_ret_12": _q8(btc_ret_12),
+            "btc_ret_5m": _q8(btc_ret_1),
+            "btc_ret_15m": _q8(btc_ret_3),
+            "btc_ret_30m": _q8(btc_ret_6),
             "btc_atr_14_pct": _q8(btc_atr_14_pct),
             "sui_btc_rel_strength_6": _q8(sui_btc_rel_strength_6),
             "btc_sui_corr_20": _q8(btc_sui_corr_20),
@@ -474,12 +569,14 @@ class FeaturePipeline:
         sui_5m_bars: Sequence[ClosedKlineBar],
         check_index: int,
         btc_5m_bars: Sequence[ClosedKlineBar] | None = None,
+        sui_15m_bars: Sequence[ClosedKlineBar] | None = None,
+        sui_1h_bars: Sequence[ClosedKlineBar] | None = None,
     ) -> tuple[bool, str]:
-        """Mathematically verify zero look-ahead leakage at `check_index` (§14.1, P3_PLAN).
+        """Mathematically verify zero look-ahead leakage at `check_index` (§14.1, P3_PLAN, Task A.8).
 
         Compares:
         1. Features extracted when the input array ends at `check_index` (`sui_5m_bars[:check_index + 1]`).
-        2. Features extracted when future bars `check_index + 1 .. N` are present.
+        2. Features extracted when future bars `check_index + 1 .. N` (including future `15m` / `1h` bars) are present.
         3. Features extracted when future bars `check_index + 1 .. N` are adversarially mutated with
            100x price spikes, flash crashes, and 1000x volume anomalies.
         """
@@ -494,10 +591,22 @@ class FeaturePipeline:
             if btc_5m_bars is not None
             else None
         )
+        truncated_15m = (
+            [b for b in sui_15m_bars if b.close_time_ms <= cutoff_ms]
+            if sui_15m_bars is not None
+            else None
+        )
+        truncated_1h = (
+            [b for b in sui_1h_bars if b.close_time_ms <= cutoff_ms]
+            if sui_1h_bars is not None
+            else None
+        )
         feat_truncated = self.extract_at_index(
             sui_5m_bars=truncated_sui,
             target_index=check_index,
             btc_5m_bars=truncated_btc,
+            sui_15m_bars=truncated_15m,
+            sui_1h_bars=truncated_1h,
         )
         hash_truncated = compute_feature_snapshot_hash(feat_truncated)
 
@@ -506,6 +615,8 @@ class FeaturePipeline:
             sui_5m_bars=sui_5m_bars,
             target_index=check_index,
             btc_5m_bars=btc_5m_bars,
+            sui_15m_bars=sui_15m_bars,
+            sui_1h_bars=sui_1h_bars,
         )
         hash_full = compute_feature_snapshot_hash(feat_full)
 
@@ -533,14 +644,15 @@ class FeaturePipeline:
                 )
             )
 
-        mutated_btc: list[ClosedKlineBar] | None = None
-        if btc_5m_bars is not None:
-            mutated_btc = []
-            for b in btc_5m_bars:
+        def _mutate_after_cutoff(series: Sequence[ClosedKlineBar] | None) -> list[ClosedKlineBar] | None:
+            if series is None:
+                return None
+            out: list[ClosedKlineBar] = []
+            for b in series:
                 if b.close_time_ms <= cutoff_ms:
-                    mutated_btc.append(b)
+                    out.append(b)
                 else:
-                    mutated_btc.append(
+                    out.append(
                         ClosedKlineBar(
                             symbol=b.symbol,
                             interval=b.interval,
@@ -560,11 +672,14 @@ class FeaturePipeline:
                             is_closed=True,
                         )
                     )
+            return out
 
         feat_mutated = self.extract_at_index(
             sui_5m_bars=mutated_sui,
             target_index=check_index,
-            btc_5m_bars=mutated_btc,
+            btc_5m_bars=_mutate_after_cutoff(btc_5m_bars),
+            sui_15m_bars=_mutate_after_cutoff(sui_15m_bars),
+            sui_1h_bars=_mutate_after_cutoff(sui_1h_bars),
         )
         hash_mutated = compute_feature_snapshot_hash(feat_mutated)
 

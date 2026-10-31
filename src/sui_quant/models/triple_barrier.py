@@ -1,21 +1,29 @@
-"""Triple-Barrier Labeling, Breakout Candidate Screening, and Purged & Embargoed Walk-Forward Splitting (§4, §6.1, §6.2, §14, P3_PLAN).
+"""Triple-Barrier Labeling, Breakout Candidate Screening, and Purged & Embargoed 3-Stage / Walk-Forward Splitting
+(§4, §6.1, §6.2, §14, P3_PLAN, Task A.2, A.3, A.4, A.5).
 
 Key Guarantees:
-1. Upward Volume Breakout Candidate Filter (§4.1):
-   - Only evaluates closed 5m K-lines (`is_closed=True`, `complete_bar_only=True`) on `SUIUSDT`.
-   - Requires `close_t > prev_20_high`, volume amplification (`rvol_20 >= min_rvol` or `vol_zscore_20 >= min_vol_zscore`),
-     bounded upper shadow (`upper_wick_ratio <= max_upper_wick_ratio`), and positive body (`close_t > open_t`).
-2. Fee-Aware Triple-Barrier Method (§4.2):
-   - Upper `WIN` barrier: `compute_c1_net_target_sell_price` achieving `+1.5%` NET profit after both buy and sell fees.
-   - Lower `STOP` barrier: `compute_stop_loss_trigger_price` at `-1.0%` below weighted entry price.
-   - Vertical `TIMEOUT` barrier: `3 hours` = `36` closed 5m bars.
+1. Task A.2 — Zero Time-Travel Between 5m Signal Confirmation and Reference Entry Quote:
+   - Signal is confirmed only AFTER 5m bar `t` closes at `signal_confirm_time_ms = bar[t].close_time_ms`.
+   - Reference entry quote is anchored at `entry_quote_time_ms = bar[t+1].open_time_ms` (`> signal_confirm_time_ms`),
+     using `EntryPriceMode.NEXT_BAR_OPEN` (`bar[t+1].open_price`) or `CONSERVATIVE_MAX_CLOSE_NEXT_OPEN`
+     (`max(bar[t].close_price, bar[t+1].open_price)`).
+   - Enforces `entry_quote_time_ms > signal_confirm_time_ms` in `TripleBarrierLabel.__post_init__`.
+2. Task A.3 & A.4 — Single-Deduction Fee/Slippage Accounting & Explicit `TIMEOUT` Net Return Formula:
+   - Upper `WIN` barrier: `compute_c1_net_target_sell_price` achieving `>= +1.5%` NET profit after buy & sell fees.
+   - Lower `STOP` barrier: `compute_stop_loss_trigger_price` at `-1.0%` below entry price, with `stop_slippage_rate`
+     applied once to `exit_price`.
+   - Vertical `TIMEOUT` barrier (`36` 5m bars = `3 hours`):
+     `raw_exit_quote_price = bar[t+36].close_price`,
+     `exit_price = raw_exit_quote_price * (1 - timeout_slippage_rate)`,
+     `gross_return = (raw_exit_quote_price - entry_price) / entry_price`,
+     `net_return = (exit_price * (1 - sell_fee_rate)) / (entry_price * (1 + buy_fee_rate)) - 1`.
 3. Intra-Bar Ambiguity Pessimistic Tie-Breaking (§4.2, P3_PLAN §03.2):
    - When a future K-line touches BOTH `high >= win_barrier_price` and `low <= stop_barrier_price` within the same bar,
      unless sub-bar tick sequence explicitly proves `WIN` was reached first, the outcome is strictly resolved as
      `BarrierOutcome.STOP` (`ambiguous_same_bar_conflict=True`).
-4. Purged & Embargoed Walk-Forward Time-Series Validation (§4.3, §14.1):
-   - Purges any training event whose 3-hour label horizon overlaps the validation fold and enforces a minimum
-     `36` 5m bar (`3 hours = 10,800,000 ms`) embargo buffer between training and validation events.
+4. Task A.5 — Strict 3-Stage Separation (`TRAIN` / `CALIBRATION` / `FINAL_TEST`) with Purge & Embargo:
+   - `PurgedThreeStageSplit` physically separates training, probability calibration, and final holdout evaluation
+     with `>= 36` 5m bars (`3 hours = 10,800,000 ms`) Purge + Embargo at BOTH boundaries (`TRAIN -> CAL` and `CAL -> TEST`).
 """
 
 from __future__ import annotations
@@ -34,7 +42,11 @@ from sui_quant.exchange_rules import (
     compute_c1_net_target_sell_price,
     compute_stop_loss_trigger_price,
 )
-from sui_quant.models.features import UnclosedBarRejectedError, _validate_closed_bar_sequence
+from sui_quant.models.features import (
+    CausalityViolationError,
+    UnclosedBarRejectedError,
+    _validate_closed_bar_sequence,
+)
 from sui_quant.utils.clock import ensure_utc
 
 
@@ -52,6 +64,14 @@ class BarrierOutcome(str, Enum):
     WIN = "WIN"          # Touched net +1.5% profit barrier first
     STOP = "STOP"        # Touched -1.0% stop-loss trigger barrier first (or same-bar pessimistic tie-break)
     TIMEOUT = "TIMEOUT"  # Neither barrier touched within 36 bars (3 hours)
+
+
+class EntryPriceMode(str, Enum):
+    """Reference entry pricing convention after 5m bar `t` closes (Task A.2)."""
+
+    NEXT_BAR_OPEN = "NEXT_BAR_OPEN"  # bar[t+1].open_price at T_open(t+1) = T_close(t) + 1ms
+    CONSERVATIVE_MAX_CLOSE_NEXT_OPEN = "CONSERVATIVE_MAX_CLOSE_NEXT_OPEN"  # max(bar[t].close, bar[t+1].open)
+    SIGNAL_BAR_CLOSE = "SIGNAL_BAR_CLOSE"  # bar[t].close_price
 
 
 @dataclass(frozen=True)
@@ -126,7 +146,7 @@ def evaluate_breakout_candidate(
 
 @dataclass(frozen=True)
 class TripleBarrierConfig:
-    """Parameters for Triple-Barrier labeling (§4.2, §6.1, §6.2)."""
+    """Parameters for Triple-Barrier labeling (§4.2, §6.1, §6.2, Task A.2, A.3, A.4)."""
 
     horizon_bars: int = THREE_HOURS_BARS                 # 36 bars * 5m = 3 hours
     target_net_return: Decimal = Decimal("0.0150")       # +1.5% net return after buy & sell fees
@@ -134,18 +154,23 @@ class TripleBarrierConfig:
     buy_fee_rate: Decimal = Decimal("0.0010")            # 10 bps spot taker/maker baseline
     sell_fee_rate: Decimal = Decimal("0.0010")           # 10 bps spot taker/maker baseline
     stop_slippage_rate: Decimal = Decimal("0.0005")      # 5 bps execution slippage on stop trigger
+    timeout_slippage_rate: Decimal = Decimal("0.0002")   # 2 bps execution slippage on 3h timeout exit (Task A.4)
+    entry_price_mode: EntryPriceMode = EntryPriceMode.NEXT_BAR_OPEN  # Task A.2 causal post-close entry quote
     filters: SymbolFilters = P0_SNAPSHOT_SUIUSDT_FILTERS
 
 
 @dataclass(frozen=True)
 class TripleBarrierLabel:
-    """Immutable Triple-Barrier outcome record for a single entry event."""
+    """Immutable Triple-Barrier outcome record for a single entry event (Task A.2, A.3, A.4)."""
 
     event_index: int
     symbol: str
     entry_time_utc: datetime
     entry_open_time_ms: int
     entry_close_time_ms: int
+    signal_confirm_time_ms: int
+    entry_quote_time_ms: int
+    entry_price_mode: str
     label_end_time_utc: datetime
     label_end_close_time_ms: int
     horizon_end_index: int
@@ -154,6 +179,7 @@ class TripleBarrierLabel:
     stop_barrier_price: Decimal
     outcome: BarrierOutcome
     bars_to_hit: int
+    raw_exit_quote_price: Decimal
     exit_price: Decimal
     gross_return: Decimal
     net_return: Decimal
@@ -164,16 +190,45 @@ class TripleBarrierLabel:
             raise ValueError(f"TripleBarrierLabel symbol must be '{TRADING_SYMBOL}'")
         ensure_utc(self.entry_time_utc, "entry_time_utc")
         ensure_utc(self.label_end_time_utc, "label_end_time_utc")
+        if self.entry_quote_time_ms <= self.signal_confirm_time_ms:
+            raise CausalityViolationError(
+                f"Time-travel violation (Task A.2): entry_quote_time_ms ({self.entry_quote_time_ms}) "
+                f"must be strictly > signal_confirm_time_ms ({self.signal_confirm_time_ms})"
+            )
         require_decimal(self.entry_price, "entry_price")
         require_decimal(self.win_barrier_price, "win_barrier_price")
         require_decimal(self.stop_barrier_price, "stop_barrier_price")
+        require_decimal(self.raw_exit_quote_price, "raw_exit_quote_price")
         require_decimal(self.exit_price, "exit_price")
         require_decimal(self.gross_return, "gross_return")
         require_decimal(self.net_return, "net_return")
 
 
+def assert_no_signal_to_entry_time_travel(
+    bars: Sequence[ClosedKlineBar],
+    label: TripleBarrierLabel,
+) -> bool:
+    """Mathematically verify Task A.2:
+    1. Signal confirmation occurs strictly at the close of 5m bar `t` (`bars[entry_index].close_time_ms`).
+    2. Entry quote timestamp is strictly at or after the open of bar `t+1` (`bars[entry_index + 1].open_time_ms > signal_confirm_time_ms`).
+    3. Barrier evaluation inspects only bars `t+1 .. t+horizon` (`open_time_ms >= entry_quote_time_ms`),
+       never using `bar[t]`'s own intra-bar high or low to trigger `WIN` or `STOP`.
+    """
+    sig_bar = bars[label.event_index]
+    next_bar = bars[label.event_index + 1]
+    if label.signal_confirm_time_ms != sig_bar.close_time_ms:
+        raise CausalityViolationError("signal_confirm_time_ms does not match signal bar close_time_ms")
+    if label.entry_quote_time_ms < next_bar.open_time_ms:
+        raise CausalityViolationError("entry_quote_time_ms precedes next bar open_time_ms")
+    if label.entry_quote_time_ms <= label.signal_confirm_time_ms:
+        raise CausalityViolationError("entry_quote_time_ms <= signal_confirm_time_ms")
+    if label.bars_to_hit < 1:
+        raise CausalityViolationError("bars_to_hit must be >= 1 (cannot hit barrier on signal bar t itself)")
+    return True
+
+
 class TripleBarrierLabeler:
-    """Fee-aware Triple-Barrier labeler with pessimistic intra-bar conflict resolution (§4.2)."""
+    """Fee-aware Triple-Barrier labeler with causal post-close entry pricing and pessimistic tie-breaking (§4.2)."""
 
     def __init__(self, config: TripleBarrierConfig | None = None) -> None:
         self.config = config or TripleBarrierConfig()
@@ -203,6 +258,27 @@ class TripleBarrierLabeler:
         )
         return win_p, stop_p
 
+    def resolve_causal_entry_price(
+        self,
+        signal_bar: ClosedKlineBar,
+        next_bar: ClosedKlineBar,
+        entry_price_override: Decimal | None = None,
+    ) -> tuple[Decimal, str]:
+        """Determine causal reference entry price after `signal_bar` closes at `signal_bar.close_time_ms` (Task A.2)."""
+        if next_bar.open_time_ms <= signal_bar.close_time_ms:
+            raise CausalityViolationError(
+                f"next_bar.open_time_ms ({next_bar.open_time_ms}) must be > signal_bar.close_time_ms ({signal_bar.close_time_ms})"
+            )
+        if entry_price_override is not None:
+            return require_decimal(entry_price_override, "entry_price_override"), "EXPLICIT_OVERRIDE"
+
+        mode = self.config.entry_price_mode
+        if mode == EntryPriceMode.NEXT_BAR_OPEN:
+            return next_bar.open_price, mode.value
+        if mode == EntryPriceMode.CONSERVATIVE_MAX_CLOSE_NEXT_OPEN:
+            return max(signal_bar.close_price, next_bar.open_price), mode.value
+        return signal_bar.close_price, mode.value
+
     def label_at_index(
         self,
         sui_5m_bars: Sequence[ClosedKlineBar],
@@ -210,10 +286,10 @@ class TripleBarrierLabeler:
         entry_price_override: Decimal | None = None,
         sub_bar_trade_prices: Mapping[int, Sequence[Decimal]] | None = None,
     ) -> TripleBarrierLabel:
-        """Compute Triple-Barrier label for an entry at the close of `sui_5m_bars[entry_index]`.
+        """Compute Triple-Barrier label for a 5m signal confirmed at the close of `sui_5m_bars[entry_index]`.
 
         Requires at least `horizon_bars` (default 36) closed 5m bars after `entry_index` so that
-        the full 3-hour horizon is observed without truncation bias.
+        the full 3-hour horizon (`t+1 .. t+36`) is observed without truncation bias.
         """
         validated = _validate_closed_bar_sequence(sui_5m_bars, TRADING_SYMBOL)
         cfg = self.config
@@ -224,11 +300,12 @@ class TripleBarrierLabeler:
                 f"but sequence length is {len(validated)}."
             )
 
-        entry_bar = validated[entry_index]
-        entry_price = (
-            require_decimal(entry_price_override, "entry_price_override")
-            if entry_price_override is not None
-            else entry_bar.close_price
+        signal_bar = validated[entry_index]
+        first_exec_bar = validated[entry_index + 1]
+        entry_price, mode_str = self.resolve_causal_entry_price(
+            signal_bar=signal_bar,
+            next_bar=first_exec_bar,
+            entry_price_override=entry_price_override,
         )
         win_barrier, stop_barrier = self.compute_barriers(entry_price)
 
@@ -237,7 +314,10 @@ class TripleBarrierLabeler:
         ambiguous_conflict = False
         horizon_end_idx = entry_index + horizon
         resolving_bar = validated[horizon_end_idx]
-        exit_price = resolving_bar.close_price
+
+        # Task A.4: Default to TIMEOUT at the 36th bar close with explicit timeout_slippage_rate
+        raw_exit_quote_price = resolving_bar.close_price
+        exit_price = _q8(raw_exit_quote_price * (Decimal("1") - cfg.timeout_slippage_rate))
 
         for step in range(1, horizon + 1):
             fut_bar = validated[entry_index + step]
@@ -246,7 +326,6 @@ class TripleBarrierLabeler:
 
             if hit_win and hit_stop:
                 ambiguous_conflict = True
-                # Check if sub-bar chronological trade sequence is available and resolves first touch
                 resolved_by_ticks: BarrierOutcome | None = None
                 if sub_bar_trade_prices and fut_bar.open_time_ms in sub_bar_trade_prices:
                     for tick_p in sub_bar_trade_prices[fut_bar.open_time_ms]:
@@ -261,9 +340,11 @@ class TripleBarrierLabeler:
                 # Pessimistic Rule (§4.2, P3_PLAN §03.2): default to STOP on any unresolved same-bar conflict
                 if resolved_by_ticks == BarrierOutcome.WIN:
                     outcome = BarrierOutcome.WIN
+                    raw_exit_quote_price = win_barrier
                     exit_price = win_barrier
                 else:
                     outcome = BarrierOutcome.STOP
+                    raw_exit_quote_price = stop_barrier
                     exit_price = _q8(stop_barrier * (Decimal("1") - cfg.stop_slippage_rate))
                 bars_to_hit = step
                 resolving_bar = fut_bar
@@ -271,6 +352,7 @@ class TripleBarrierLabeler:
 
             if hit_stop:
                 outcome = BarrierOutcome.STOP
+                raw_exit_quote_price = stop_barrier
                 exit_price = _q8(stop_barrier * (Decimal("1") - cfg.stop_slippage_rate))
                 bars_to_hit = step
                 resolving_bar = fut_bar
@@ -278,26 +360,30 @@ class TripleBarrierLabeler:
 
             if hit_win:
                 outcome = BarrierOutcome.WIN
+                raw_exit_quote_price = win_barrier
                 exit_price = win_barrier
                 bars_to_hit = step
                 resolving_bar = fut_bar
                 break
 
-        gross_ret = _q8((exit_price - entry_price) / entry_price)
-        # Exact round-trip net return after buy & sell fees:
-        # net_proceeds / gross_cost - 1 = [exit_price * (1 - f_sell)] / [entry_price * (1 + f_buy)] - 1
+        # Task A.3 & A.4: Exact single-deduction gross and net return formulas
+        # gross_return: pure quote return before fees and exit slippage
+        gross_ret = _q8((raw_exit_quote_price - entry_price) / entry_price)
+        # net_return: [exit_price * (1 - sell_fee_rate)] / [entry_price * (1 + buy_fee_rate)] - 1
         cost_basis = entry_price * (Decimal("1") + cfg.buy_fee_rate)
         net_proceeds = exit_price * (Decimal("1") - cfg.sell_fee_rate)
         net_ret = _q8((net_proceeds - cost_basis) / cost_basis)
 
-        # Full label span ends at the 3h horizon close time (for conservative Purge & Embargo accounting)
         full_horizon_bar = validated[horizon_end_idx]
         return TripleBarrierLabel(
             event_index=entry_index,
             symbol=TRADING_SYMBOL,
-            entry_time_utc=entry_bar.exchange_time_utc,
-            entry_open_time_ms=entry_bar.open_time_ms,
-            entry_close_time_ms=entry_bar.close_time_ms,
+            entry_time_utc=signal_bar.exchange_time_utc,
+            entry_open_time_ms=signal_bar.open_time_ms,
+            entry_close_time_ms=signal_bar.close_time_ms,
+            signal_confirm_time_ms=signal_bar.close_time_ms,
+            entry_quote_time_ms=first_exec_bar.open_time_ms,
+            entry_price_mode=mode_str,
             label_end_time_utc=full_horizon_bar.exchange_time_utc,
             label_end_close_time_ms=full_horizon_bar.close_time_ms,
             horizon_end_index=horizon_end_idx,
@@ -306,6 +392,7 @@ class TripleBarrierLabeler:
             stop_barrier_price=stop_barrier,
             outcome=outcome,
             bars_to_hit=bars_to_hit,
+            raw_exit_quote_price=raw_exit_quote_price,
             exit_price=exit_price,
             gross_return=gross_ret,
             net_return=net_ret,
@@ -326,15 +413,24 @@ class PurgedWalkForwardFold:
     min_time_gap_ms_between_train_end_and_val_start: int
 
 
-class PurgedWalkForwardSplitter:
-    """Purged and Embargoed Walk-Forward cross-validation splitter (§4.3, §14.1, P3_PLAN).
+@dataclass(frozen=True)
+class PurgedThreeStageSplit:
+    """Strict 3-way split (`TRAIN`, `CALIBRATION`, `FINAL_TEST`) with Purge + Embargo at both boundaries (Task A.5)."""
 
-    Guarantees that between the last training event in a fold and the first validation event:
-    1. No training label's 3-hour forward window (`horizon_end_index` / `label_end_close_time_ms`)
-       overlaps with the validation fold start.
-    2. An explicit embargo buffer of `>= embargo_bars` (default `36` 5m bars = `3 hours`) separates
-       all training event indices from validation event indices (`val_event_index - train_event_index >= 36`).
-    """
+    train_indices: tuple[int, ...]
+    cal_indices: tuple[int, ...]
+    test_indices: tuple[int, ...]
+    purged_train_to_cal_count: int
+    purged_cal_to_test_count: int
+    embargo_bars: int
+    min_bar_gap_train_to_cal: int
+    min_bar_gap_cal_to_test: int
+    min_time_gap_ms_train_to_cal: int
+    min_time_gap_ms_cal_to_test: int
+
+
+class PurgedWalkForwardSplitter:
+    """Purged and Embargoed Walk-Forward and 3-Stage (`TRAIN / CALIBRATION / FINAL_TEST`) splitter (§4.3, §14.1, Task A.5)."""
 
     def __init__(
         self,
@@ -360,7 +456,6 @@ class PurgedWalkForwardSplitter:
                 f"Insufficient labeled events ({n}) for n_splits={self.n_splits} and min_train_events={self.min_train_events}"
             )
 
-        # Ensure labels are strictly ordered by event_index
         for i in range(1, n):
             if labels[i].event_index <= labels[i - 1].event_index:
                 raise ValueError("labels must be strictly sorted by ascending event_index")
@@ -378,7 +473,7 @@ class PurgedWalkForwardSplitter:
             if val_start_pos >= n or val_end_pos <= val_start_pos:
                 continue
 
-            val_Positions = tuple(range(val_start_pos, val_end_pos))
+            val_positions = tuple(range(val_start_pos, val_end_pos))
             first_val_label = labels[val_start_pos]
 
             train_positions: list[int] = []
@@ -386,7 +481,6 @@ class PurgedWalkForwardSplitter:
             for pos in range(0, val_start_pos):
                 cand = labels[pos]
                 bar_gap = first_val_label.event_index - cand.event_index
-                # Purge if candidate's 3h label horizon reaches into validation start OR violates embargo_bars
                 overlaps_horizon = cand.horizon_end_index >= first_val_label.event_index
                 overlaps_time = cand.label_end_close_time_ms >= first_val_label.entry_open_time_ms
                 violates_embargo = bar_gap < self.embargo_bars
@@ -406,7 +500,7 @@ class PurgedWalkForwardSplitter:
             fold = PurgedWalkForwardFold(
                 fold_id=fold_id,
                 train_indices=tuple(train_positions),
-                val_indices=val_Positions,
+                val_indices=val_positions,
                 purged_count=purged_cnt,
                 embargo_bars=self.embargo_bars,
                 min_bar_gap_between_train_and_val=min_bar_gap,
@@ -418,6 +512,89 @@ class PurgedWalkForwardSplitter:
         if not folds:
             raise ValueError("No valid PurgedWalkForwardFold could be constructed with the given embargo")
         return folds
+
+    def split_train_calibration_test(
+        self,
+        labels: Sequence[TripleBarrierLabel],
+        train_ratio: float = 0.50,
+        cal_ratio: float = 0.25,
+    ) -> PurgedThreeStageSplit:
+        """Partition chronological events into strictly disjoint `TRAIN`, `CALIBRATION`, and `FINAL_TEST`
+        sets with `>= embargo_bars` (36 bars = 3 hours) Purge + Embargo at BOTH boundaries (Task A.5).
+        """
+        n = len(labels)
+        if n < 12:
+            raise ValueError(f"Need at least 12 labeled events for 3-stage purged split, got {n}")
+        if train_ratio <= 0.1 or cal_ratio <= 0.1 or (train_ratio + cal_ratio) >= 0.9:
+            raise ValueError("Invalid train_ratio / cal_ratio")
+
+        for i in range(1, n):
+            if labels[i].event_index <= labels[i - 1].event_index:
+                raise ValueError("labels must be strictly sorted by ascending event_index")
+
+        cal_start_pos = max(4, int(n * train_ratio))
+        test_start_pos = max(cal_start_pos + 3, int(n * (train_ratio + cal_ratio)))
+        if test_start_pos >= n:
+            test_start_pos = n - 2
+
+        first_cal = labels[cal_start_pos]
+        first_test = labels[test_start_pos]
+
+        # 1. Build TRAIN indices (purging any event overlapping or within embargo_bars of first_cal)
+        train_pos: list[int] = []
+        purged_train_cal = 0
+        for pos in range(0, cal_start_pos):
+            cand = labels[pos]
+            bar_gap = first_cal.event_index - cand.event_index
+            if (
+                cand.horizon_end_index >= first_cal.event_index
+                or cand.label_end_close_time_ms >= first_cal.entry_open_time_ms
+                or bar_gap < self.embargo_bars
+            ):
+                purged_train_cal += 1
+            else:
+                train_pos.append(pos)
+
+        # 2. Build CALIBRATION indices (purging any event overlapping or within embargo_bars of first_test)
+        cal_pos: list[int] = []
+        purged_cal_test = 0
+        for pos in range(cal_start_pos, test_start_pos):
+            cand = labels[pos]
+            bar_gap = first_test.event_index - cand.event_index
+            if (
+                cand.horizon_end_index >= first_test.event_index
+                or cand.label_end_close_time_ms >= first_test.entry_open_time_ms
+                or bar_gap < self.embargo_bars
+            ):
+                purged_cal_test += 1
+            else:
+                cal_pos.append(pos)
+
+        # 3. Build FINAL_TEST indices
+        test_pos = tuple(range(test_start_pos, n))
+        if not train_pos or not cal_pos or not test_pos:
+            raise ValueError(
+                f"3-stage split produced an empty stage after 3h purge/embargo "
+                f"(train={len(train_pos)}, cal={len(cal_pos)}, test={len(test_pos)})"
+            )
+
+        last_train = labels[train_pos[-1]]
+        last_cal = labels[cal_pos[-1]]
+
+        split_obj = PurgedThreeStageSplit(
+            train_indices=tuple(train_pos),
+            cal_indices=tuple(cal_pos),
+            test_indices=test_pos,
+            purged_train_to_cal_count=purged_train_cal,
+            purged_cal_to_test_count=purged_cal_test,
+            embargo_bars=self.embargo_bars,
+            min_bar_gap_train_to_cal=first_cal.event_index - last_train.event_index,
+            min_bar_gap_cal_to_test=first_test.event_index - last_cal.event_index,
+            min_time_gap_ms_train_to_cal=first_cal.entry_open_time_ms - last_train.entry_open_time_ms,
+            min_time_gap_ms_cal_to_test=first_test.entry_open_time_ms - last_cal.entry_open_time_ms,
+        )
+        self.verify_three_stage_zero_leakage(labels, split_obj)
+        return split_obj
 
     def verify_fold_zero_leakage(
         self,
@@ -447,4 +624,41 @@ class PurgedWalkForwardSplitter:
                         f"Timestamp overlap between train[{ti}] label end ({t_lbl.label_end_close_time_ms}) "
                         f"and val[{vi}] entry start ({v_lbl.entry_open_time_ms})"
                     )
+        return True
+
+    def verify_three_stage_zero_leakage(
+        self,
+        labels: Sequence[TripleBarrierLabel],
+        split_obj: PurgedThreeStageSplit,
+    ) -> bool:
+        """Mathematically verify Task A.5:
+        1. `train_indices`, `cal_indices`, and `test_indices` are 100% mutually disjoint.
+        2. Every `(train, cal)` pair is separated by `>= embargo_bars` (`36` bars = 3h) with zero horizon overlap.
+        3. Every `(cal, test)` pair is separated by `>= embargo_bars` (`36` bars = 3h) with zero horizon overlap.
+        4. Every `(train, test)` pair is separated by `>= 2 * embargo_bars` with zero horizon overlap.
+        """
+        s_tr = set(split_obj.train_indices)
+        s_ca = set(split_obj.cal_indices)
+        s_te = set(split_obj.test_indices)
+        if (s_tr & s_ca) or (s_ca & s_te) or (s_tr & s_te):
+            raise CausalityViolationError("3-stage split sets (TRAIN, CALIBRATION, FINAL_TEST) are not disjoint!")
+
+        for earlier_indices, later_indices, stage_name in (
+            (split_obj.train_indices, split_obj.cal_indices, "TRAIN->CALIBRATION"),
+            (split_obj.cal_indices, split_obj.test_indices, "CALIBRATION->FINAL_TEST"),
+            (split_obj.train_indices, split_obj.test_indices, "TRAIN->FINAL_TEST"),
+        ):
+            for ei in earlier_indices:
+                e_lbl = labels[ei]
+                for li in later_indices:
+                    l_lbl = labels[li]
+                    bar_diff = l_lbl.event_index - e_lbl.event_index
+                    if bar_diff < self.embargo_bars:
+                        raise CausalityViolationError(
+                            f"Embargo violation on {stage_name}: gap={bar_diff} < {self.embargo_bars}"
+                        )
+                    if e_lbl.horizon_end_index >= l_lbl.event_index:
+                        raise CausalityViolationError(f"Horizon overlap on {stage_name}")
+                    if e_lbl.label_end_close_time_ms >= l_lbl.entry_open_time_ms:
+                        raise CausalityViolationError(f"Timestamp overlap on {stage_name}")
         return True
