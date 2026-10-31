@@ -21,7 +21,7 @@
 - **已完成基座（P0 & P1）**：
   - [`src/sui_quant/contracts.py`](file:///D:/OBR-SUI/src/sui_quant/contracts.py) 已冻结 `MarketEvent`、`MarketFeatures(complete_bar_only)`、`DataQuality`。
   - 日本云主机已部署并验证 `sui-quant-r01.service` 与 `sui-quant-guardian.service`，到币安现货 WebSocket (`stream.binance.com:9443`) 实测 TLS 握手延迟 `15.58 ms`。
-- **P2 待验证事项**：72 小时连续 WebSocket 订阅（含 23h 提前热切换轮换）在 2vCPU/2GB 环境下的内存平稳度与零丢包表现。
+- **P2 待验证事项**：72 小时连续 WebSocket 订阅（含 23h 提前热切换轮换与跨连接缺口检测）在 2vCPU/2GB 环境下的内存平稳度与异常恢复表现（注：网络层不承诺绝对零丢包，任何跨连接序列号缺口均触发 `GAP_DETECTED` 停新仓与 REST 回补）。
 
 ---
 
@@ -42,8 +42,9 @@
 2. **双层扫描时钟**：
    - **1s 快速候选扫描**：基于内存环形缓冲区计算短窗成交速率、点差异常与 BTC 1m 急跌（仅作预警或紧急熔断，不直接触发买入）。
    - **K 线收盘事件驱动**：5m K 线收盘（`k.x == True`）唯一触发 `A-02` 正式候选评估；1m/15m/1h 收盘更新 `A-01` 状态特征。
-3. **23 小时连接热切换（Hot Rotation）**：
-   - 币安 WebSocket 单连接最长有效期为 24 小时；采集器在连接建立满 **23 小时** 时，先建立备用 WebSocket 连接并完成订阅确认，通过去重窗口无缝切换至新连接后再关闭旧连接，实现零缺口轮换。
+3. **23 小时连接热切换（Hot Rotation — 跨连接去重与缺口检测，不承诺绝对零丢包）**：
+   - 币安 WebSocket 单连接最长有效期为 24 小时；采集器在连接建立满 **23 小时** 时，先建立备用 WebSocket 连接并完成订阅确认，通过 `StreamQualityGuard` 去重窗口过滤双连接重叠事件后再关闭旧连接。
+   - **诚实工程边界（不承诺绝对零丢包）**：双连接热切换仅用于最小化轮换中断，在公网抖动或双路丢包下**绝不承诺绝对零丢包（`zero_loss_guaranteed = False`）**。切换期间强制执行跨连接序列号连续性核验（`strict_consecutive_seq=True`）；一旦发现新旧连接间或流内存在序列号断层（`next_seq > prev_seq + 1`），立即判定 `gap_detected=True`、置为 `DataQuality.GAP_DETECTED`、联动 `D-01` 进入 `ENTRY_FROZEN`，写入 `OrderbookGapMarker(recoverable=False)` 并触发 REST K 线对账回补。
    - 若发生意外断线：立即将行情健康状态置为 `DataQuality.GAP_DETECTED`（联动 `D-01` 禁止新开仓），重连后通过 REST `/api/v3/klines` 补齐缺失的已完成 K 线，并对断线期间缺失的 `depth10` 快照写入显式 `OrderbookGapMarker(recoverable=False)`，完全恢复一致性后方可解除冻结。
 
 ---
@@ -73,11 +74,12 @@
 
 ## 06 测试清单（QA-01 / QA-02 专项验证）
 
+- `test_p2_remediation_item1_rfc6455_websocket_ping_pong_fragmented_close_tls_and_reconnect`：验证自研 RFC 6455 客户端的 TLSv1.3 证书校验、握手 `Sec-WebSocket-Accept` 校验、3 段分片帧重组 + 分片中间穿插 `PING/PONG` 控制帧、主动 `PING/PONG`、`CLOSE(1001)` 双向关闭握手、断线自动重连与非法控制帧拦截。
 - `test_qa01_duplicate_and_out_of_order_rejection`：注入重复 `aggTrade`/`depth10` 与倒序更新 ID，验证去重与乱序拦截。
-- `test_qa01_kline_close_once_and_unclosed_isolation`：注入同一根 5m K 线的 10 次未收盘更新（`x=False`）与 2 次重复收盘推送（`x=True`），验证 `complete_bar_only` 仅触发唯一一次 5m 收盘信号。
+- `test_qa01_kline_close_once_and_unclosed_isolation`：注入同一根 5m K 线的 10 次未收盘更新（`x=False`）与 3 次重复收盘推送（`x=True`），验证 `complete_bar_only` 仅触发唯一一次 5m 收盘信号。
 - `test_qa01_ws_disconnect_gap_marking_and_kline_backfill`：注入断网 3 分钟，验证立即冻结新开仓、REST 补齐 K 线、且断线期盘口显式标记 `GAP_UNRECOVERABLE_FOR_FILL_CALIBRATION`。
-- `test_qa01_23h_hot_connection_rotation_zero_gap`：验证 23h 提前双连接热切换期间零重复、零漏事件。
-- `test_qa02_100ms_depth_backpressure_and_bounded_memory`：注入高频 `depth10@100ms` 突发洪峰，验证 RingBuffer 与有界队列内存占用严格受控，陈旧行情触发停新仓。
+- `test_qa01_23h_hot_connection_rotation_dedup_and_gap_detection_item2`：验证 23h 提前双连接热切换的跨连接重叠去重、显式 `zero_loss_guaranteed=False` 声明，以及跨连接发生序列缺口（`209..211` 丢失）时立即识别缺口、标记 `GAP_DETECTED` 并进入 `ENTRY_FROZEN`。
+- `test_qa02_100ms_depth_backpressure_critical_zero_loss_and_drop_telemetry_item3`：注入高频 `depth10@100ms` 突发洪峰，验证关键已收盘 K 线（`k.x=True`）与数据质量事件（`STALE`/`GAP_DETECTED`）**零丢失（`critical_dropped_count == 0`）**，且完整记录 `100ms -> 1000ms -> 100ms` 降级恢复轨迹与按类别丢弃统计 `dropped_by_category`。
 - `test_p2_incremental_sync_checkpoint_sha256_and_secret_block`：验证 Windows 断线续传、SHA-256 篡改拒收、重复分片幂等入库及凭据文件同步拦截。
 
 ---

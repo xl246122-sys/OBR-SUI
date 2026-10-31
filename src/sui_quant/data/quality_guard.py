@@ -1,5 +1,6 @@
-"""Data quality guard for F-01: deduplication, out-of-order rejection, staleness check,
-closed vs. unclosed K-line physical isolation, and unrecoverable orderbook gap marking (§2.1, §14.1, QA-01, QA-02).
+"""Data quality guard for F-01: deduplication, out-of-order rejection, sequence gap detection,
+staleness check, closed vs. unclosed K-line physical isolation, and unrecoverable orderbook gap marking
+(§2.1, §14.1, QA-01, QA-02, P2 Remediation Items 2 & 3).
 """
 
 from __future__ import annotations
@@ -17,6 +18,26 @@ from sui_quant.utils.clock import ensure_utc
 
 CALIBRATION_UNRECOVERABLE_TAG = "GAP_UNRECOVERABLE_FOR_FILL_CALIBRATION"
 PARTIAL_BOOK_SCOPE_DECLARATION = "TOP10_AGGREGATED_SNAPSHOT_NO_L3_QUEUE_POSITION"
+
+
+@dataclass(frozen=True)
+class SequenceGapRecord:
+    """Explicit record of a sequence discontinuity detected within or across WebSocket connections."""
+
+    symbol: str
+    source: str
+    prev_seq_id: int
+    next_seq_id: int
+    missing_start_seq: int
+    missing_end_seq: int
+    missing_count: int
+    detected_at_utc: datetime
+    connection_context: str = "SINGLE_STREAM"
+
+    def __post_init__(self) -> None:
+        ensure_utc(self.detected_at_utc, "detected_at_utc")
+        if self.missing_count <= 0 or self.missing_end_seq < self.missing_start_seq:
+            raise ValueError("Invalid SequenceGapRecord bounds")
 
 
 @dataclass(frozen=True)
@@ -185,9 +206,9 @@ class PartialOrderbookSnapshot:
 
 @dataclass(frozen=True)
 class OrderbookGapMarker:
-    """Explicit unrecoverable gap marker for partial orderbook streams during WS disconnects (§2.1, §14.1, QA-01).
+    """Explicit unrecoverable gap marker for partial orderbook streams during WS disconnects or rotation gaps (§2.1, §14.1, QA-01).
 
-    Since historical `@depth10@100ms` states cannot be reconstructed via REST after a disconnect,
+    Since historical `@depth10@100ms` states cannot be reconstructed via REST after a disconnect or sequence gap,
     any gap window is permanently tagged `GAP_UNRECOVERABLE_FOR_FILL_CALIBRATION` and blocked from
     being used in B-01 limit-order fill probability calibration.
     """
@@ -218,8 +239,8 @@ class OrderbookGapMarker:
 
 
 class StreamQualityGuard:
-    """Stateful quality guard enforcing deduplication, sequence monotonicity, staleness bounds,
-    closed/unclosed K-line isolation, and unrecoverable orderbook gap tracking.
+    """Stateful quality guard enforcing deduplication, sequence monotonicity, sequence gap detection,
+    staleness bounds, closed/unclosed K-line isolation, and unrecoverable orderbook gap tracking.
     """
 
     def __init__(
@@ -240,6 +261,7 @@ class StreamQualityGuard:
 
         # Monotonic sequence tracking per (symbol, stream_category)
         self._last_seq: dict[tuple[str, str], int] = {}
+        self._sequence_gaps: list[SequenceGapRecord] = []
 
         # Closed vs Unclosed K-line physical isolation
         self._closed_bar_dedup_keys: set[tuple[str, str, int]] = set()
@@ -281,14 +303,32 @@ class StreamQualityGuard:
     def orderbook_gaps(self) -> tuple[OrderbookGapMarker, ...]:
         return tuple(self._orderbook_gaps)
 
-    def evaluate_event(self, event: MarketEvent) -> DataQuality:
-        """Validate a `MarketEvent` for deduplication, sequence order, and staleness (QA-01, QA-02)."""
+    @property
+    def sequence_gaps(self) -> tuple[SequenceGapRecord, ...]:
+        return tuple(self._sequence_gaps)
+
+    def get_last_seq(self, symbol: str, source: str) -> int | None:
+        return self._last_seq.get((symbol, source))
+
+    def evaluate_event(
+        self,
+        event: MarketEvent,
+        strict_consecutive_seq: bool = False,
+        connection_context: str = "SINGLE_STREAM",
+    ) -> DataQuality:
+        """Validate a `MarketEvent` for deduplication, sequence order, sequence gaps, and staleness (QA-01, QA-02).
+
+        If `strict_consecutive_seq=True` (e.g., during 23h hot connection rotation gap verification),
+        any jump `event.seq_or_update_id > prev_seq + 1` immediately flags `DataQuality.GAP_DETECTED`.
+        Even when `strict_consecutive_seq=False`, sequence jumps on `aggTrade` are recorded in `sequence_gaps`.
+        """
         dedup_key = (event.symbol, event.source, event.event_id)
         if dedup_key in self._dedup_set:
             self._duplicate_count += 1
             return DataQuality.DUPLICATE
 
         stream_key = (event.symbol, event.source)
+        seq_gap_detected = False
         if event.seq_or_update_id is not None:
             prev_seq = self._last_seq.get(stream_key)
             if prev_seq is not None:
@@ -298,6 +338,23 @@ class StreamQualityGuard:
                 if event.seq_or_update_id < prev_seq:
                     self._out_of_order_count += 1
                     return DataQuality.OUT_OF_ORDER
+                if event.source == "aggTrade" and event.seq_or_update_id > prev_seq + 1:
+                    gap_rec = SequenceGapRecord(
+                        symbol=event.symbol,
+                        source=event.source,
+                        prev_seq_id=prev_seq,
+                        next_seq_id=event.seq_or_update_id,
+                        missing_start_seq=prev_seq + 1,
+                        missing_end_seq=event.seq_or_update_id - 1,
+                        missing_count=event.seq_or_update_id - prev_seq - 1,
+                        detected_at_utc=event.recv_time_utc,
+                        connection_context=connection_context,
+                    )
+                    self._sequence_gaps.append(gap_rec)
+                    if strict_consecutive_seq:
+                        self._gap_count += 1
+                        self._current_quality = DataQuality.GAP_DETECTED
+                        seq_gap_detected = True
             self._last_seq[stream_key] = event.seq_or_update_id
 
         # Record in bounded deduplication window
@@ -313,6 +370,9 @@ class StreamQualityGuard:
             self._stale_count += 1
             self._current_quality = DataQuality.STALE
             return DataQuality.STALE
+
+        if seq_gap_detected:
+            return DataQuality.GAP_DETECTED
 
         return DataQuality.OK
 
@@ -454,7 +514,7 @@ class StreamQualityGuard:
         first_update_id_after_gap: int | None,
         reason: str = "WS_DISCONNECT_ORDERBOOK_UNRECOVERABLE",
     ) -> OrderbookGapMarker:
-        """Record an explicit unrecoverable orderbook gap marker during disconnect recovery."""
+        """Record an explicit unrecoverable orderbook gap marker during disconnect or rotation gap recovery."""
         marker = OrderbookGapMarker(
             gap_id=gap_id,
             symbol=symbol,

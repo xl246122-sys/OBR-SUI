@@ -1,16 +1,19 @@
 """Fixed-capacity zero-leak memory ring buffer and bounded backpressure queue for F-01 (§2.1, §13, QA-02).
 
-Guarantees strictly bounded memory on the 2vCPU / 2GB RAM cloud server even under extreme
-`depth10@100ms` and `aggTrade` message bursts.
+P2 Remediation (Item 3):
+- Strictly guarantees that critical closed K-lines (`k.x == True`) and DataQuality / control events
+  (`STALE`, `GAP_DETECTED`, `OUT_OF_ORDER`, `WS_DISCONNECT`) are NEVER dropped under any backpressure scenario
+  (`critical_dropped_count == 0` invariant).
+- Records granular snapshot degradation and drop statistics (`dropped_by_category`, `degradation_events`,
+  `high_watermark_triggers`, `low_watermark_recoveries`, `critical_enqueued_count`, `transient_dropped_count`).
 """
 
 from __future__ import annotations
 
-import asyncio
 from collections import deque
 from dataclasses import dataclass
 from decimal import Decimal
-from typing import Callable, Generic, Iterable, TypeVar
+from typing import Any, Callable, Generic, TypeVar
 
 from sui_quant.contracts import require_decimal
 
@@ -24,6 +27,25 @@ class BufferTelemetry:
     total_appended: int
     total_evicted: int
     utilization_pct: Decimal
+
+
+@dataclass(frozen=True)
+class BackpressureTelemetry:
+    """Comprehensive telemetry for F-01 backpressure queue, snapshot degradation, and drop accounting."""
+
+    maxsize: int
+    current_qsize: int
+    peak_qsize: int
+    total_enqueued: int
+    critical_enqueued_count: int
+    critical_dropped_count: int
+    transient_enqueued_count: int
+    transient_dropped_count: int
+    dropped_by_category: dict[str, int]
+    degraded_mode: bool
+    high_watermark_triggers: int
+    low_watermark_recoveries: int
+    degradation_events: tuple[dict[str, Any], ...]
 
 
 class FixedRingBuffer(Generic[T]):
@@ -118,13 +140,17 @@ class FixedRingBuffer(Generic[T]):
 
 
 class BoundedBackpressureQueue(Generic[T]):
-    """Bounded ingestion queue enforcing backpressure watermarks and automatic stream degradation (QA-02).
+    """Bounded ingestion queue enforcing backpressure watermarks, automatic stream degradation,
+    and zero-loss protection for critical closed K-lines and DataQuality events (QA-02, Item 3).
 
-    - Never exceeds `maxsize` items in memory.
-    - When queue occupancy reaches `high_watermark_ratio` (default 80%), triggers `on_high_watermark`
-      (e.g., degrading `suiusdt@depth10@100ms` to `1000ms` and emitting an audit event).
-    - When full (`len == maxsize`), drops the oldest droppable item (or oldest item) so the producer
-      never blocks the asyncio event loop and memory never grows unbounded.
+    Invariants:
+    1. Critical items (`is_critical_fn(item) == True`: closed K-lines `k.x=True` and DataQuality events)
+       are NEVER dropped (`critical_dropped_count == 0`).
+    2. When occupancy reaches `high_watermark_ratio` (default 80%), triggers `on_high_watermark`
+       (degrading `suiusdt@depth10@100ms` to `1000ms` and recording a degradation event).
+    3. When full (`len >= maxsize`), only non-critical transient snapshots (`depth10`, `bookTicker`,
+       `kline_unclosed`, `aggTrade`) are shed, and every drop is recorded by category in
+       `dropped_by_category`.
     """
 
     def __init__(
@@ -133,7 +159,9 @@ class BoundedBackpressureQueue(Generic[T]):
         high_watermark_ratio: Decimal = Decimal("0.80"),
         low_watermark_ratio: Decimal = Decimal("0.40"),
         is_critical_fn: Callable[[T], bool] | None = None,
+        category_fn: Callable[[T], str] | None = None,
         on_high_watermark: Callable[[int, int], None] | None = None,
+        on_low_watermark_recovery: Callable[[int, int], None] | None = None,
     ) -> None:
         if maxsize <= 0:
             raise ValueError("maxsize must be > 0")
@@ -145,14 +173,22 @@ class BoundedBackpressureQueue(Generic[T]):
         self.high_watermark_count = max(1, int(Decimal(maxsize) * hw))
         self.low_watermark_count = max(0, int(Decimal(maxsize) * lw))
         self._is_critical_fn = is_critical_fn
+        self._category_fn = category_fn
         self._on_high_watermark = on_high_watermark
+        self._on_low_watermark_recovery = on_low_watermark_recovery
+
         self._deque: deque[T] = deque()
-        self._not_empty = asyncio.Condition()
         self._peak_size = 0
         self._dropped_count = 0
+        self._critical_dropped_count = 0
         self._total_enqueued = 0
+        self._critical_enqueued_count = 0
+        self._transient_enqueued_count = 0
+        self._dropped_by_category: dict[str, int] = {}
         self._degraded_mode = False
         self._high_watermark_triggers = 0
+        self._low_watermark_recoveries = 0
+        self._degradation_events: list[dict[str, Any]] = []
 
     @property
     def qsize(self) -> int:
@@ -167,6 +203,22 @@ class BoundedBackpressureQueue(Generic[T]):
         return self._dropped_count
 
     @property
+    def critical_dropped_count(self) -> int:
+        return self._critical_dropped_count
+
+    @property
+    def critical_enqueued_count(self) -> int:
+        return self._critical_enqueued_count
+
+    @property
+    def transient_enqueued_count(self) -> int:
+        return self._transient_enqueued_count
+
+    @property
+    def dropped_by_category(self) -> dict[str, int]:
+        return dict(self._dropped_by_category)
+
+    @property
     def total_enqueued(self) -> int:
         return self._total_enqueued
 
@@ -178,37 +230,102 @@ class BoundedBackpressureQueue(Generic[T]):
     def high_watermark_triggers(self) -> int:
         return self._high_watermark_triggers
 
-    def put_nowait(self, item: T) -> bool:
-        """Enqueue an item without blocking or exceeding `maxsize`.
+    @property
+    def low_watermark_recoveries(self) -> int:
+        return self._low_watermark_recoveries
 
-        Returns True if enqueued without dropping, False if an older item had to be shed.
+    @property
+    def degradation_events(self) -> tuple[dict[str, Any], ...]:
+        return tuple(self._degradation_events)
+
+    def _is_critical(self, item: T) -> bool:
+        if self._is_critical_fn is None:
+            return False
+        return bool(self._is_critical_fn(item))
+
+    def _category(self, item: T) -> str:
+        if self._category_fn is None:
+            return "transient_default"
+        return str(self._category_fn(item))
+
+    def _record_drop(self, category: str) -> None:
+        self._dropped_count += 1
+        self._dropped_by_category[category] = self._dropped_by_category.get(category, 0) + 1
+
+    def put_nowait(self, item: T) -> bool:
+        """Enqueue an item while strictly guaranteeing critical items are never dropped.
+
+        Returns True if enqueued without shedding any item, False if a transient item was shed.
         """
+        incoming_critical = self._is_critical(item)
+        incoming_cat = self._category(item)
         shed = False
+
         if len(self._deque) >= self.maxsize:
-            self._shed_one_item()
-            shed = True
+            evicted_transient = self._evict_oldest_transient()
+            if evicted_transient:
+                shed = True
+            elif not incoming_critical:
+                # Queue consists 100% of critical items and incoming item is transient:
+                # drop incoming transient item rather than ever evicting a critical item!
+                self._record_drop(incoming_cat)
+                self._check_high_watermark()
+                return False
+            # If incoming_critical is True and queue is 100% critical items, we preserve
+            # the critical item without dropping anything (zero critical loss invariant).
 
         self._deque.append(item)
         self._total_enqueued += 1
+        if incoming_critical:
+            self._critical_enqueued_count += 1
+        else:
+            self._transient_enqueued_count += 1
+
         cur_len = len(self._deque)
         if cur_len > self._peak_size:
             self._peak_size = cur_len
 
+        self._check_high_watermark()
+        return not shed
+
+    def _check_high_watermark(self) -> None:
+        cur_len = len(self._deque)
         if not self._degraded_mode and cur_len >= self.high_watermark_count:
             self._degraded_mode = True
             self._high_watermark_triggers += 1
+            self._degradation_events.append(
+                {
+                    "transition": "DEGRADED_100MS_TO_1000MS",
+                    "trigger_seq": self._high_watermark_triggers,
+                    "qsize": cur_len,
+                    "maxsize": self.maxsize,
+                }
+            )
             if self._on_high_watermark is not None:
                 self._on_high_watermark(cur_len, self.maxsize)
 
-        return not shed
+    def _check_low_watermark(self) -> None:
+        cur_len = len(self._deque)
+        if self._degraded_mode and cur_len <= self.low_watermark_count:
+            self._degraded_mode = False
+            self._low_watermark_recoveries += 1
+            self._degradation_events.append(
+                {
+                    "transition": "RECOVERED_1000MS_TO_100MS",
+                    "recovery_seq": self._low_watermark_recoveries,
+                    "qsize": cur_len,
+                    "maxsize": self.maxsize,
+                }
+            )
+            if self._on_low_watermark_recovery is not None:
+                self._on_low_watermark_recovery(cur_len, self.maxsize)
 
     def get_nowait(self) -> T | None:
         """Pop the oldest item from the queue, updating watermark state."""
         if not self._deque:
             return None
         item = self._deque.popleft()
-        if self._degraded_mode and len(self._deque) <= self.low_watermark_count:
-            self._degraded_mode = False
+        self._check_low_watermark()
         return item
 
     def drain_batch(self, max_items: int = 256) -> list[T]:
@@ -216,19 +333,36 @@ class BoundedBackpressureQueue(Generic[T]):
         batch: list[T] = []
         while self._deque and len(batch) < max_items:
             batch.append(self._deque.popleft())
-        if self._degraded_mode and len(self._deque) <= self.low_watermark_count:
-            self._degraded_mode = False
+        self._check_low_watermark()
         return batch
 
-    def _shed_one_item(self) -> None:
-        """Evict the oldest non-critical item (or oldest item if all are critical)."""
-        if not self._deque:
-            return
-        if self._is_critical_fn is not None:
-            for idx, existing in enumerate(self._deque):
-                if not self._is_critical_fn(existing):
-                    del self._deque[idx]
-                    self._dropped_count += 1
-                    return
-        self._deque.popleft()
-        self._dropped_count += 1
+    def _evict_oldest_transient(self) -> bool:
+        """Find and evict the oldest non-critical item in `_deque`.
+
+        Never evicts an item where `_is_critical(item) == True`.
+        Returns True if a transient item was found and evicted, False if all items in `_deque` are critical.
+        """
+        for idx, existing in enumerate(self._deque):
+            if not self._is_critical(existing):
+                cat = self._category(existing)
+                del self._deque[idx]
+                self._record_drop(cat)
+                return True
+        return False
+
+    def telemetry(self) -> BackpressureTelemetry:
+        return BackpressureTelemetry(
+            maxsize=self.maxsize,
+            current_qsize=len(self._deque),
+            peak_qsize=self._peak_size,
+            total_enqueued=self._total_enqueued,
+            critical_enqueued_count=self._critical_enqueued_count,
+            critical_dropped_count=self._critical_dropped_count,
+            transient_enqueued_count=self._transient_enqueued_count,
+            transient_dropped_count=self._dropped_count,
+            dropped_by_category=dict(self._dropped_by_category),
+            degraded_mode=self._degraded_mode,
+            high_watermark_triggers=self._high_watermark_triggers,
+            low_watermark_recoveries=self._low_watermark_recoveries,
+            degradation_events=tuple(self._degradation_events),
+        )

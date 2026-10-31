@@ -2,30 +2,30 @@
   "test_classification": "REAL_WALLCLOCK_72H_OBSERVATION",
   "is_accelerated_simulation": false,
   "verification_status": "PENDING",
-  "pending_reason": "Real continuous 72h observation in progress: 1562.6s / 259200s elapsed",
+  "pending_reason": "Real continuous 72h observation in progress: 3846.4s / 259200s elapsed",
   "started_at_utc": "2026-10-31T06:05:40.064449+00:00",
-  "latest_sample_utc": "2026-10-31T06:31:42.666748+00:00",
+  "latest_sample_utc": "2026-10-31T07:09:46.468632+00:00",
   "target_completion_utc": "2026-11-03T06:05:40.064449+00:00",
-  "real_elapsed_seconds": 1562.6,
-  "real_elapsed_hours": 0.4341,
+  "real_elapsed_seconds": 3846.4,
+  "real_elapsed_hours": 1.0684,
   "required_wallclock_hours": 72.0,
-  "completion_pct": 0.6029,
-  "total_samples_recorded": 27,
+  "completion_pct": 1.484,
+  "total_samples_recorded": 65,
   "latest_sample": {
-    "sample_seq": 27,
-    "sampled_at_utc": "2026-10-31T06:31:42.666748+00:00",
+    "sample_seq": 65,
+    "sampled_at_utc": "2026-10-31T07:09:46.468632+00:00",
     "started_at_utc": "2026-10-31T06:05:40.064449+00:00",
-    "real_elapsed_seconds": 1562.6,
-    "real_elapsed_hours": 0.4341,
+    "real_elapsed_seconds": 3846.4,
+    "real_elapsed_hours": 1.0684,
     "cpu": {
-      "load_1m": 0.15,
-      "load_5m": 0.1,
-      "load_15m": 0.11
+      "load_1m": 0.06,
+      "load_5m": 0.18,
+      "load_15m": 0.2
     },
     "memory": {
       "mem_total_mib": 1962.49,
-      "mem_available_mib": 1382.48,
-      "mem_used_mib": 580.01,
+      "mem_available_mib": 1390.07,
+      "mem_used_mib": 572.42,
       "swap_total_mib": 2048.0,
       "swap_used_mib": 0.46
     },
@@ -38,7 +38,7 @@
         "active_state": "active",
         "sub_state": "running",
         "main_pid": 96453,
-        "rss_mib": 14.97,
+        "rss_mib": 14.89,
         "nrestarts": 0,
         "started_utc": ""
       },
@@ -46,7 +46,7 @@
         "active_state": "active",
         "sub_state": "running",
         "main_pid": 96454,
-        "rss_mib": 14.77,
+        "rss_mib": 14.93,
         "nrestarts": 0,
         "started_utc": ""
       }
@@ -58,37 +58,37 @@
         "r01": {
           "pid": 96453,
           "boot_id": "SYS-96453",
-          "heartbeat_utc": "2026-10-31T06:31:41.327411+00:00",
-          "age_sec": 1.339,
-          "loop_tick_seq": 314,
-          "rss_mib": 31.24
+          "heartbeat_utc": "2026-10-31T07:09:41.515480+00:00",
+          "age_sec": 4.953,
+          "loop_tick_seq": 770,
+          "rss_mib": 31.25
         },
         "guardian": {
           "pid": 96454,
           "boot_id": "SYS-96454",
-          "heartbeat_utc": "2026-10-31T06:31:41.326312+00:00",
-          "age_sec": 1.34,
-          "loop_tick_seq": 314,
+          "heartbeat_utc": "2026-10-31T07:09:41.516233+00:00",
+          "age_sec": 4.952,
+          "loop_tick_seq": 770,
           "rss_mib": 31.21
         },
         "f01": {
-          "pid": 102893,
-          "boot_id": "d1d2c483ca9b",
-          "heartbeat_utc": "2026-10-31T06:31:40.417520+00:00",
-          "age_sec": 2.249,
-          "loop_tick_seq": 1,
-          "rss_mib": 35.88
+          "pid": 111904,
+          "boot_id": "b1b6a59deacd",
+          "heartbeat_utc": "2026-10-31T07:09:42.554810+00:00",
+          "age_sec": 3.914,
+          "loop_tick_seq": 18,
+          "rss_mib": 41.19
         }
       }
     },
     "disk": {
       "root_total_gib": 48.584,
-      "root_free_gib": 40.379,
-      "root_used_pct": 12.59,
-      "state_dir_bytes": 3653944,
-      "log_dir_bytes": 38595,
-      "state_dir_growth_bytes": 3460800,
-      "log_dir_growth_bytes": 38595
+      "root_free_gib": 40.37,
+      "root_used_pct": 12.61,
+      "state_dir_bytes": 7984919,
+      "log_dir_bytes": 97878,
+      "state_dir_growth_bytes": 7791775,
+      "log_dir_growth_bytes": 97878
     }
   }
 }

@@ -10,10 +10,12 @@ from sui_quant.data.quality_guard import (
     ClosedKlineBar,
     OrderbookGapMarker,
     PartialOrderbookSnapshot,
+    SequenceGapRecord,
     StreamQualityGuard,
     UnclosedKlineTransientView,
 )
 from sui_quant.data.ring_buffer import (
+    BackpressureTelemetry,
     BoundedBackpressureQueue,
     BufferTelemetry,
     FixedRingBuffer,
@@ -30,6 +32,7 @@ from sui_quant.data.sync_engine import (
 
 __all__ = [
     "AggTradeRecord",
+    "BackpressureTelemetry",
     "BinanceSpotWebSocketStream",
     "BookTickerQuote",
     "BoundedBackpressureQueue",
@@ -48,12 +51,17 @@ __all__ = [
     "PARTIAL_BOOK_SCOPE_DECLARATION",
     "PartialOrderbookSnapshot",
     "SecretSyncBlockedError",
+    "SequenceGapRecord",
     "ShardManifestEntry",
     "StreamQualityGuard",
     "SyncIntegrityError",
     "SyncRunReport",
     "UnclosedKlineTransientView",
+    "WebSocketClosedError",
+    "WebSocketHandshakeError",
+    "WebSocketProtocolError",
     "assert_safe_for_sync",
+    "compute_rfc6455_accept_key",
     "fetch_binance_rest_klines",
 ]
 
@@ -68,6 +76,10 @@ def __getattr__(name: str) -> Any:
         "F01MarketCollector",
         "FastScanSnapshot",
         "LatencyPercentiles",
+        "WebSocketClosedError",
+        "WebSocketHandshakeError",
+        "WebSocketProtocolError",
+        "compute_rfc6455_accept_key",
         "fetch_binance_rest_klines",
     }:
         from sui_quant.data import collector

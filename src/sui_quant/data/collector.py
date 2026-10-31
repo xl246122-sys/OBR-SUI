@@ -1,5 +1,6 @@
 """F-01 Market Data Collector: Real-time Binance Spot WebSocket ingestion (`SUIUSDT` & `BTCUSDT`),
-dual-tier scanning clock (1s fast scan + 5m closed-bar signal trigger), 23h proactive hot rotation,
+RFC 6455 protocol-hardened TLS WebSocket client, dual-tier scanning clock (1s fast scan + 5m closed-bar trigger),
+23h proactive hot rotation with cross-connection deduplication and sequence-gap detection (no false zero-loss promise),
 disconnect gap marking & REST K-line backfill, and bounded SQLite WAL / spool storage (§2, §13, §14).
 """
 
@@ -14,12 +15,11 @@ import os
 import sqlite3
 import ssl
 import struct
-import time
 import urllib.parse
 import urllib.request
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -42,13 +42,18 @@ from sui_quant.data.quality_guard import (
     PartialOrderbookSnapshot,
     StreamQualityGuard,
 )
-from sui_quant.data.ring_buffer import BoundedBackpressureQueue, FixedRingBuffer
+from sui_quant.data.ring_buffer import (
+    BackpressureTelemetry,
+    BoundedBackpressureQueue,
+    FixedRingBuffer,
+)
 from sui_quant.state_machine import StateTransitionRecord, TradingState, assert_valid_transition
 from sui_quant.utils.clock import ensure_utc, monotonic_ns, utc_now
 
 
 HOT_ROTATION_THRESHOLD_SEC = 23 * 3600  # 23 hours (proactive rotation before 24h Binance WS limit)
 MAX_SPOOL_QUOTA_BYTES = int(4.0 * (1024**3))  # <= 4.0 GB cloud rolling spool quota (§11.1)
+RFC6455_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 DEFAULT_COMBINED_STREAMS_100MS: tuple[str, ...] = (
     "suiusdt@aggTrade",
@@ -70,6 +75,29 @@ DEGRADED_COMBINED_STREAMS_1000MS: tuple[str, ...] = tuple(
     "suiusdt@depth10@1000ms" if s == "suiusdt@depth10@100ms" else s
     for s in DEFAULT_COMBINED_STREAMS_100MS
 )
+
+
+class WebSocketProtocolError(ConnectionError):
+    """Raised when the peer violates RFC 6455 framing, handshake, or size invariants."""
+
+
+class WebSocketHandshakeError(WebSocketProtocolError):
+    """Raised when the HTTP/1.1 101 WebSocket Upgrade or Sec-WebSocket-Accept verification fails."""
+
+
+class WebSocketClosedError(ConnectionError):
+    """Raised when a RFC 6455 CLOSE frame (opcode 0x8) is received from the server."""
+
+    def __init__(self, close_code: int, close_reason: str = "") -> None:
+        self.close_code = close_code
+        self.close_reason = close_reason
+        super().__init__(f"WebSocket closed by peer: code={close_code}, reason='{close_reason}'")
+
+
+def compute_rfc6455_accept_key(sec_websocket_key: str) -> str:
+    """Compute the RFC 6455 §4.2.2 `Sec-WebSocket-Accept` value for a given `Sec-WebSocket-Key`."""
+    digest = hashlib.sha1((sec_websocket_key.strip() + RFC6455_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
 
 
 @dataclass(frozen=True)
@@ -185,14 +213,17 @@ class F01MarketCollector:
         self.latency_samples_ms: FixedRingBuffer[Decimal] = FixedRingBuffer(2000)
 
         # Backpressure queue with automatic 100ms -> 1000ms depth stream degradation
+        # and guaranteed protection for closed K-lines + DataQuality events (Item 3)
         self._depth_sampling_ms = 100
-        self.ingestion_queue: BoundedBackpressureQueue[ tuple[Mapping[str, Any], datetime, int] ] = (
+        self.ingestion_queue: BoundedBackpressureQueue[tuple[Mapping[str, Any], datetime, int]] = (
             BoundedBackpressureQueue(
                 maxsize=queue_maxsize,
                 high_watermark_ratio=Decimal("0.80"),
                 low_watermark_ratio=Decimal("0.40"),
                 is_critical_fn=self._is_critical_raw_frame,
+                category_fn=self._categorize_raw_frame,
                 on_high_watermark=self._handle_backpressure_high_watermark,
+                on_low_watermark_recovery=self._handle_backpressure_low_watermark_recovery,
             )
         )
 
@@ -204,9 +235,10 @@ class F01MarketCollector:
         self._disconnect_started_utc: datetime | None = None
         self._last_depth_update_id_before_disconnect: int | None = None
 
-        # Counters for QA-01 / QA-02 verification
+        # Counters for QA-01 / QA-02 / Item 3 verification
         self.five_min_signal_trigger_count: int = 0
         self.total_valid_events_processed: int = 0
+        self.data_quality_events_processed: int = 0
 
         self._init_f01_tables()
 
@@ -257,17 +289,68 @@ class F01MarketCollector:
     def depth_sampling_ms(self) -> int:
         return self._depth_sampling_ms
 
-    @staticmethod
-    def _is_critical_raw_frame(item: tuple[Mapping[str, Any], datetime, int]) -> bool:
-        raw, _, _ = item
-        data = raw.get("data", raw) if isinstance(raw, Mapping) else {}
-        if isinstance(data, Mapping) and data.get("e") == "kline":
+    def _is_critical_raw_frame(self, item: tuple[Mapping[str, Any], datetime, int]) -> bool:
+        """Identify frames that MUST NEVER be dropped under backpressure (Item 3):
+        1. Closed K-line bars (`e == 'kline'` and `k.x == True`);
+        2. Explicit DataQuality / control events (`e == 'data_quality_event'`, `is_data_quality_event == True`,
+           or `data_quality` flag present and != OK);
+        3. Stale frames (`recv_time_utc - exchange_time_utc > max_staleness_ms`) that must trigger `DataQuality.STALE`.
+        """
+        raw, recv_utc, _ = item
+        if not isinstance(raw, Mapping):
+            return False
+        if raw.get("is_data_quality_event") is True or raw.get("data_quality") not in (None, "OK", DataQuality.OK):
+            return True
+        data = raw.get("data", raw)
+        if not isinstance(data, Mapping):
+            return False
+        event_type = str(data.get("e", ""))
+        if event_type == "data_quality_event":
+            return True
+        if event_type == "kline" or "k" in data:
             k = data.get("k", {})
-            return bool(isinstance(k, Mapping) and k.get("x") is True)
+            if isinstance(k, Mapping) and k.get("x") is True:
+                return True
+        # Check if frame is stale so staleness DataQuality events are never shed before freezing entry
+        ex_ms = data.get("E")
+        if ex_ms is not None:
+            try:
+                lag_ms = (recv_utc.timestamp() * 1000.0) - float(ex_ms)
+                if lag_ms > self.quality_guard.max_staleness_ms:
+                    return True
+            except (TypeError, ValueError):
+                pass
         return False
 
+    @staticmethod
+    def _categorize_raw_frame(item: tuple[Mapping[str, Any], datetime, int]) -> str:
+        raw, _, _ = item
+        if not isinstance(raw, Mapping):
+            return "invalid"
+        if raw.get("is_data_quality_event") is True or raw.get("data_quality") not in (None, "OK", DataQuality.OK):
+            return "data_quality"
+        stream_name = str(raw.get("stream", ""))
+        data = raw.get("data", raw)
+        if not isinstance(data, Mapping):
+            return "invalid"
+        event_type = str(data.get("e", ""))
+        if event_type == "data_quality_event":
+            return "data_quality"
+        if event_type == "kline" or "k" in data:
+            k = data.get("k", {})
+            if isinstance(k, Mapping) and k.get("x") is True:
+                return "kline_closed"
+            return "kline_unclosed"
+        if "lastUpdateId" in data or "depth10" in stream_name:
+            return "depth10"
+        if event_type == "aggTrade" or stream_name.endswith("@aggTrade"):
+            return "aggTrade"
+        if "u" in data or stream_name.endswith("@bookTicker"):
+            return "bookTicker"
+        return "other"
+
     def _handle_backpressure_high_watermark(self, current_qsize: int, maxsize: int) -> None:
-        """Automatically degrade depth10@100ms to 1000ms when queue occupancy reaches >= 80% (QA-02)."""
+        """Automatically degrade depth10@100ms to 1000ms when queue occupancy reaches >= 80% (QA-02, Item 3)."""
         self._depth_sampling_ms = 1000
         self.alert_manager.emit_alert(
             severity=AlertSeverity.HIGH,
@@ -281,6 +364,14 @@ class F01MarketCollector:
             },
         )
 
+    def _handle_backpressure_low_watermark_recovery(self, current_qsize: int, maxsize: int) -> None:
+        """Restore depth10@100ms when queue drains below low watermark (<= 40%)."""
+        self._depth_sampling_ms = 100
+
+    def get_backpressure_telemetry(self) -> BackpressureTelemetry:
+        """Return complete snapshot degradation and drop statistics (Item 3)."""
+        return self.ingestion_queue.telemetry()
+
     def enqueue_raw_message(
         self,
         raw_payload: Mapping[str, Any],
@@ -291,6 +382,30 @@ class F01MarketCollector:
         r_utc = ensure_utc(recv_time_utc or utc_now(), "recv_time_utc")
         r_mono = recv_mono_ns if recv_mono_ns is not None else monotonic_ns()
         return self.ingestion_queue.put_nowait((raw_payload, r_utc, r_mono))
+
+    def enqueue_data_quality_event(
+        self,
+        quality: DataQuality,
+        reason: str,
+        symbol: str = TRADING_SYMBOL,
+        recv_time_utc: datetime | None = None,
+        recv_mono_ns: int | None = None,
+    ) -> bool:
+        """Enqueue an explicit critical DataQuality event that is guaranteed never to be shed under backpressure."""
+        r_utc = ensure_utc(recv_time_utc or utc_now(), "recv_time_utc")
+        r_mono = recv_mono_ns if recv_mono_ns is not None else monotonic_ns()
+        payload = {
+            "is_data_quality_event": True,
+            "data_quality": quality.value,
+            "data": {
+                "e": "data_quality_event",
+                "s": symbol,
+                "quality": quality.value,
+                "reason": reason,
+                "E": int(r_utc.timestamp() * 1000),
+            },
+        }
+        return self.ingestion_queue.put_nowait((payload, r_utc, r_mono))
 
     def drain_and_process_queue(self, max_items: int = 512) -> int:
         """Drain up to `max_items` from the bounded queue and process them."""
@@ -307,8 +422,9 @@ class F01MarketCollector:
         recv_time_utc: datetime | None = None,
         recv_mono_ns: int | None = None,
         source_conn_id: str | None = None,
+        strict_consecutive_seq: bool = False,
     ) -> DataQuality:
-        """Parse, validate, deduplicate, and route a single Binance Spot WebSocket message."""
+        """Parse, validate, deduplicate, and route a single Binance Spot WebSocket or DataQuality message."""
         r_utc = ensure_utc(recv_time_utc or utc_now(), "recv_time_utc")
         r_mono = recv_mono_ns if recv_mono_ns is not None else monotonic_ns()
 
@@ -323,6 +439,18 @@ class F01MarketCollector:
             symbol = stream_name.split("@", 1)[0].upper()
         if symbol not in ALLOWED_SYMBOLS:
             return DataQuality.INVALID_PAYLOAD
+
+        # Route 0: Explicit critical DataQuality event (Item 3)
+        if event_type == "data_quality_event" or raw_payload.get("is_data_quality_event") is True:
+            q_str = str(data.get("quality", raw_payload.get("data_quality", "GAP_DETECTED")))
+            q_val = DataQuality(q_str)
+            reason = str(data.get("reason", "EXPLICIT_DATA_QUALITY_EVENT"))
+            self.quality_guard._current_quality = q_val
+            self.data_quality_events_processed += 1
+            if q_val != DataQuality.OK:
+                self._freeze_new_entry_on_unhealthy_data(f"DATA_QUALITY_EVENT:{q_val.value}:{reason}", r_utc)
+            self._record_processing_latency(r_mono)
+            return q_val
 
         # Route 1: aggTrade (`@aggTrade`)
         if event_type == "aggTrade" or stream_name.endswith("@aggTrade"):
@@ -340,12 +468,20 @@ class F01MarketCollector:
                 payload=data,
                 seq_or_update_id=agg_id,
             )
-            quality = self.quality_guard.evaluate_event(mkt_event)
-            if quality != DataQuality.OK:
-                if quality == DataQuality.STALE:
-                    self._freeze_new_entry_on_unhealthy_data("STALE_AGGTRADE_EVENT", r_utc)
+            quality = self.quality_guard.evaluate_event(
+                mkt_event,
+                strict_consecutive_seq=strict_consecutive_seq,
+                connection_context=source_conn_id or "SINGLE_STREAM",
+            )
+            if quality == DataQuality.STALE:
+                self.data_quality_events_processed += 1
+                self._freeze_new_entry_on_unhealthy_data("STALE_AGGTRADE_EVENT", r_utc)
+                return quality
+            if quality in {DataQuality.DUPLICATE, DataQuality.OUT_OF_ORDER}:
                 return quality
 
+            # Even if quality == GAP_DETECTED under strict_consecutive_seq, record the valid trade
+            # that arrived after the gap AND freeze new entries due to the detected sequence gap!
             rec = AggTradeRecord(
                 symbol=symbol,
                 agg_trade_id=agg_id,
@@ -361,7 +497,10 @@ class F01MarketCollector:
             self.trade_buffers[symbol].append(rec)
             self._record_processing_latency(r_mono)
             self.total_valid_events_processed += 1
-            return DataQuality.OK
+            if quality == DataQuality.GAP_DETECTED:
+                self.data_quality_events_processed += 1
+                self._freeze_new_entry_on_unhealthy_data(f"AGGTRADE_SEQUENCE_GAP_AT_{agg_id}", r_utc)
+            return quality
 
         # Route 2: Partial Book Depth (`@depth10@100ms` or `@depth10@1000ms`)
         if "lastUpdateId" in data and ("bids" in data or "b" in data):
@@ -382,6 +521,7 @@ class F01MarketCollector:
             quality = self.quality_guard.evaluate_event(mkt_event)
             if quality != DataQuality.OK:
                 if quality == DataQuality.STALE:
+                    self.data_quality_events_processed += 1
                     self._freeze_new_entry_on_unhealthy_data("STALE_DEPTH10_SNAPSHOT", r_utc)
                 return quality
 
@@ -423,6 +563,7 @@ class F01MarketCollector:
             quality = self.quality_guard.evaluate_event(mkt_event)
             if quality != DataQuality.OK:
                 if quality == DataQuality.STALE:
+                    self.data_quality_events_processed += 1
                     self._freeze_new_entry_on_unhealthy_data("STALE_BOOKTICKER_EVENT", r_utc)
                 return quality
 
@@ -454,6 +595,7 @@ class F01MarketCollector:
             if lag_ms > self.quality_guard.max_staleness_ms:
                 self.quality_guard._stale_count += 1
                 self.quality_guard._current_quality = DataQuality.STALE
+                self.data_quality_events_processed += 1
                 self._freeze_new_entry_on_unhealthy_data("STALE_KLINE_EVENT", r_utc)
                 return DataQuality.STALE
 
@@ -624,11 +766,16 @@ class F01MarketCollector:
         overlapping_standby_frames: Sequence[tuple[Mapping[str, Any], datetime, int]],
         rotated_at_utc: datetime | None = None,
     ) -> dict[str, Any]:
-        """Perform 23-hour dual-connection hot rotation (QA-01):
-        1. Open `standby_conn_id = new_conn_id` while `active_conn_id` continues streaming;
-        2. Process overlapping frames from both connections through `StreamQualityGuard` deduplication;
-        3. Promote `new_conn_id` to `active_conn_id` and close old connection with zero missed events and
-           zero duplicate downstream emissions.
+        """Perform 23-hour dual-connection hot rotation with cross-connection deduplication AND
+        sequence-gap detection (QA-01, P2 Remediation Item 2).
+
+        Governance & Engineering Reality (Item 2):
+        - Dual-connection warm handoff reduces cutover disruption via cross-connection deduplication,
+          but NEVER promises absolute zero packet loss (`zero_loss_guaranteed = False`).
+        - If a sequence discontinuity occurs across `old_conn_id -> new_conn_id` (e.g., `standby` first
+          sequence ID > `primary` last sequence ID + 1), the gap is explicitly detected (`gap_detected = True`),
+          `DataQuality.GAP_DETECTED` is set, new entries are frozen (`ENTRY_FROZEN`), and an
+          `OrderbookGapMarker(recoverable=False)` is persisted.
         """
         ref_now = ensure_utc(rotated_at_utc or utc_now(), "rotated_at_utc")
         old_conn_id = self.active_conn_id
@@ -636,6 +783,7 @@ class F01MarketCollector:
 
         accepted_count = 0
         deduped_count = 0
+        gaps_before = len(self.quality_guard.sequence_gaps)
 
         # Step 1: Drain active primary connection frames up to warm handoff point
         for raw_p, utc_p, mono_p in overlapping_primary_frames:
@@ -644,25 +792,51 @@ class F01MarketCollector:
                 recv_time_utc=utc_p,
                 recv_mono_ns=mono_p,
                 source_conn_id=old_conn_id,
+                strict_consecutive_seq=True,
             )
-            if q_p == DataQuality.OK:
+            if q_p in {DataQuality.OK, DataQuality.GAP_DETECTED}:
                 accepted_count += 1
             elif q_p == DataQuality.DUPLICATE:
                 deduped_count += 1
 
-        # Step 2: Seamlessly switch to standby connection and drain warm-up buffer
-        # Overlapping frames already seen on primary are deduplicated by StreamQualityGuard._dedup_set
+        primary_last_seq = self.quality_guard.get_last_seq(TRADING_SYMBOL, "aggTrade")
+
+        # Step 2: Switch to standby connection and drain warm-up buffer with strict gap detection
         for raw_s, utc_s, mono_s in overlapping_standby_frames:
             q_s = self.process_ws_message(
                 raw_s,
                 recv_time_utc=utc_s,
                 recv_mono_ns=mono_s,
                 source_conn_id=new_conn_id,
+                strict_consecutive_seq=True,
             )
-            if q_s == DataQuality.OK:
+            if q_s in {DataQuality.OK, DataQuality.GAP_DETECTED}:
                 accepted_count += 1
             elif q_s == DataQuality.DUPLICATE:
                 deduped_count += 1
+
+        new_gaps = self.quality_guard.sequence_gaps[gaps_before:]
+        gap_detected = len(new_gaps) > 0
+        missing_ranges = [(g.missing_start_seq, g.missing_end_seq) for g in new_gaps]
+
+        if gap_detected:
+            self.quality_guard.mark_ws_disconnected()
+            self._freeze_new_entry_on_unhealthy_data(
+                f"HOT_ROTATION_23H_GAP:{old_conn_id}->{new_conn_id}:missing={missing_ranges}",
+                ref_now,
+            )
+            gap_id = f"GAP-ROT-{ref_now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            marker = self.quality_guard.record_unrecoverable_orderbook_gap(
+                gap_id=gap_id,
+                symbol=TRADING_SYMBOL,
+                stream=f"depth10@{self._depth_sampling_ms}ms",
+                gap_start_utc=ref_now,
+                gap_end_utc=ref_now,
+                last_update_id_before_gap=primary_last_seq,
+                first_update_id_after_gap=self.quality_guard.get_last_seq(TRADING_SYMBOL, "aggTrade"),
+                reason=f"HOT_ROTATION_SEQUENCE_GAP:{missing_ranges}",
+            )
+            self._persist_orderbook_gap(marker)
 
         self.active_conn_id = new_conn_id
         self.standby_conn_id = None
@@ -675,6 +849,9 @@ class F01MarketCollector:
             "rotated_at_utc": ref_now.isoformat(),
             "accepted_unique_events": accepted_count,
             "deduplicated_overlap_events": deduped_count,
+            "gap_detected": gap_detected,
+            "missing_seq_ranges": missing_ranges,
+            "zero_loss_guaranteed": False,
             "hot_rotation_count": self.hot_rotation_count,
         }
 
@@ -821,12 +998,24 @@ def fetch_binance_rest_klines(
 
 
 class BinanceSpotWebSocketStream:
-    """Zero-dependency RFC 6455 TLS 1.3 WebSocket client for `stream.binance.com:9443`.
+    """RFC 6455 Protocol-Hardened & Fail-Safe TLS WebSocket Client for `stream.binance.com:9443` (Item 1).
 
-    Avoids external WebSocket library bloat on the 2GB RAM cloud server while supporting:
-    - Combined market streams (`/stream?streams=...`)
-    - Fragmented frame reassembly
-    - Automatic masked `PONG` (0xA) replies to server `PING` (0x9) frames
+    Protocol Compatibility & Safety Guarantees:
+    1. Handshake Verification (RFC 6455 §4.2.2): Validates HTTP 101 status, `Upgrade: websocket`,
+       `Connection: Upgrade`, and exact SHA-1 `Sec-WebSocket-Accept` digest.
+    2. Fragmented Frames & Interleaved Control Frames (RFC 6455 §5.4 & §5.5):
+       - Reassembles multi-frame fragmented messages (`FIN=0, opcode=0x1` -> `FIN=0, opcode=0x0` -> `FIN=1, opcode=0x0`).
+       - Allows `PING` (`0x9`) and `PONG` (`0xA`) control frames to arrive in the middle of a fragmented
+         message without corrupting the in-flight fragment buffer.
+       - Rejects protocol violations: non-zero `RSV1..3` bits, fragmented control frames (`opcode >= 0x8` with `FIN=0`),
+         control frames with payload > 125 bytes, uninitiated continuation frames (`opcode=0x0` when not fragmenting),
+         and overlapping new data frames (`opcode in {0x1, 0x2}` while a fragmented message is incomplete).
+    3. Memory Fail-Safety Bounds: Enforces `max_frame_payload_bytes` (default 4 MiB) and `max_message_bytes`
+       (default 8 MiB) prior to socket allocation to prevent OOM attacks on the 2GB cloud server.
+    4. Close Frame Handshake (RFC 6455 §5.5.1): Parses 2-byte status code and UTF-8 reason on `0x8 CLOSE`,
+       echoes a masked `CLOSE` frame back to peer, closes transport, and raises `WebSocketClosedError(code, reason)`.
+    5. TLS Verification: Enforces `ssl.CERT_REQUIRED`, hostname verification, `TLSv1.2+` minimum, and
+       records negotiated `tls_version` and `tls_cipher`.
     """
 
     def __init__(
@@ -834,22 +1023,67 @@ class BinanceSpotWebSocketStream:
         streams: Sequence[str] = DEFAULT_COMBINED_STREAMS_100MS,
         host: str = "stream.binance.com",
         port: int = 9443,
+        ssl_context: ssl.SSLContext | None = None,
+        server_hostname: str | None = None,
+        max_frame_payload_bytes: int = 4 * 1024 * 1024,
+        max_message_bytes: int = 8 * 1024 * 1024,
     ) -> None:
         self.streams = tuple(streams)
         self.host = host
         self.port = port
+        self.ssl_context = ssl_context
+        self.server_hostname = server_hostname or host
+        self.max_frame_payload_bytes = max_frame_payload_bytes
+        self.max_message_bytes = max_message_bytes
+
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
+        self._close_sent: bool = False
+
+        # Protocol & fail-safety telemetry (Item 1)
+        self.tls_version: str | None = None
+        self.tls_cipher: str | None = None
+        self.pings_received_and_replied: int = 0
+        self.last_ping_payload: bytes = b""
+        self.pongs_received: int = 0
+        self.last_pong_payload: bytes = b""
+        self.fragmented_messages_reassembled: int = 0
+        self.close_frames_received: int = 0
+        self.last_close_code: int | None = None
+        self.last_close_reason: str = ""
+        self.reconnect_count: int = 0
+
+    @staticmethod
+    def build_default_tls_context() -> ssl.SSLContext:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        return ctx
 
     async def connect(self, timeout_sec: float = 10.0) -> None:
-        ssl_ctx = ssl.create_default_context()
+        ctx = self.ssl_context if self.ssl_context is not None else self.build_default_tls_context()
+        self._close_sent = False
         self._reader, self._writer = await asyncio.wait_for(
-            asyncio.open_connection(self.host, self.port, ssl=ssl_ctx),
+            asyncio.open_connection(
+                self.host,
+                self.port,
+                ssl=ctx,
+                server_hostname=self.server_hostname if ctx.check_hostname else None,
+            ),
             timeout=timeout_sec,
         )
+        ssl_obj = self._writer.get_extra_info("ssl_object")
+        if ssl_obj is not None:
+            self.tls_version = ssl_obj.version()
+            cipher_info = ssl_obj.cipher()
+            self.tls_cipher = cipher_info[0] if cipher_info else None
+
         stream_path = "/".join(self.streams)
         path = f"/stream?streams={stream_path}"
         ws_key = base64.b64encode(os.urandom(16)).decode("ascii")
+        expected_accept = compute_rfc6455_accept_key(ws_key)
+
         handshake = (
             f"GET {path} HTTP/1.1\r\n"
             f"Host: {self.host}:{self.port}\r\n"
@@ -861,27 +1095,77 @@ class BinanceSpotWebSocketStream:
         self._writer.write(handshake.encode("ascii"))
         await self._writer.drain()
 
-        status_line = await asyncio.wait_for(self._reader.readline(), timeout=timeout_sec)
-        if b"101" not in status_line:
-            raise ConnectionError(f"WebSocket upgrade failed: {status_line.decode('latin1', errors='replace').strip()}")
+        status_line_bytes = await asyncio.wait_for(self._reader.readline(), timeout=timeout_sec)
+        status_line = status_line_bytes.decode("latin1", errors="replace").strip()
+        if not status_line.startswith("HTTP/1.1 101"):
+            await self._abort_transport()
+            raise WebSocketHandshakeError(f"WebSocket upgrade failed: {status_line}")
+
+        headers: dict[str, str] = {}
         while True:
-            hdr = await asyncio.wait_for(self._reader.readline(), timeout=timeout_sec)
-            if hdr in (b"\r\n", b"\n", b""):
+            hdr_bytes = await asyncio.wait_for(self._reader.readline(), timeout=timeout_sec)
+            if hdr_bytes in (b"\r\n", b"\n", b""):
                 break
+            line = hdr_bytes.decode("latin1", errors="replace").strip()
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+
+        if headers.get("upgrade", "").lower() != "websocket":
+            await self._abort_transport()
+            raise WebSocketHandshakeError(f"Missing or invalid Upgrade header: {headers.get('upgrade')!r}")
+        if "upgrade" not in headers.get("connection", "").lower():
+            await self._abort_transport()
+            raise WebSocketHandshakeError(f"Missing or invalid Connection header: {headers.get('connection')!r}")
+        actual_accept = headers.get("sec-websocket-accept", "")
+        if actual_accept != expected_accept:
+            await self._abort_transport()
+            raise WebSocketHandshakeError(
+                f"Sec-WebSocket-Accept mismatch: expected {expected_accept!r}, got {actual_accept!r}"
+            )
+
+    async def reconnect(self, timeout_sec: float = 10.0) -> None:
+        """Close any existing session and establish a fresh WebSocket connection."""
+        await self.close()
+        self.reconnect_count += 1
+        await self.connect(timeout_sec=timeout_sec)
+
+    async def send_ping(self, payload: bytes = b"SUIQ-PING") -> None:
+        """Send a masked RFC 6455 PING control frame (opcode 0x9)."""
+        if len(payload) > 125:
+            raise WebSocketProtocolError("PING payload cannot exceed 125 bytes (RFC 6455 §5.5)")
+        await self._send_masked_frame(0x9, payload)
 
     async def recv_json(self, timeout_sec: float = 30.0) -> tuple[dict[str, Any], datetime, int]:
-        """Read next JSON text frame, automatically replying to PING frames."""
+        """Read next complete JSON message, handling fragmented frames and interleaved control frames."""
         if self._reader is None or self._writer is None:
             raise ConnectionError("WebSocket is not connected")
 
         fragments: list[bytes] = []
+        accumulated_bytes = 0
+        fragment_count = 0
+
         while True:
             hdr2 = await asyncio.wait_for(self._reader.readexactly(2), timeout=timeout_sec)
             b1, b2 = hdr2[0], hdr2[1]
             fin = bool(b1 & 0x80)
+            rsv = b1 & 0x70
             opcode = b1 & 0x0F
             masked = bool(b2 & 0x80)
             payload_len = b2 & 0x7F
+
+            if rsv != 0:
+                await self._abort_transport()
+                raise WebSocketProtocolError(f"Non-zero RSV bits (0x{rsv:02x}) without negotiated extension")
+
+            is_control = bool(opcode & 0x08)
+            if is_control:
+                if not fin:
+                    await self._abort_transport()
+                    raise WebSocketProtocolError(f"Fragmented control frame (opcode=0x{opcode:x}, FIN=0) forbidden by RFC 6455 §5.5")
+                if payload_len > 125:
+                    await self._abort_transport()
+                    raise WebSocketProtocolError(f"Control frame payload length ({payload_len}) > 125 forbidden by RFC 6455 §5.5")
 
             if payload_len == 126:
                 ext = await asyncio.wait_for(self._reader.readexactly(2), timeout=timeout_sec)
@@ -890,23 +1174,84 @@ class BinanceSpotWebSocketStream:
                 ext = await asyncio.wait_for(self._reader.readexactly(8), timeout=timeout_sec)
                 payload_len = struct.unpack("!Q", ext)[0]
 
+            if payload_len > self.max_frame_payload_bytes:
+                await self._abort_transport()
+                raise WebSocketProtocolError(
+                    f"Frame payload ({payload_len} B) exceeds max_frame_payload_bytes ({self.max_frame_payload_bytes} B)"
+                )
+
             mask_key = await asyncio.wait_for(self._reader.readexactly(4), timeout=timeout_sec) if masked else b""
             payload = await asyncio.wait_for(self._reader.readexactly(payload_len), timeout=timeout_sec)
             if masked:
                 payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
 
+            # Handle Control Frames (0x8 CLOSE, 0x9 PING, 0xA PONG) — may be interleaved inside fragmented data!
             if opcode == 0x8:  # CLOSE
-                raise ConnectionError("WebSocket server sent CLOSE frame")
-            if opcode == 0x9:  # PING -> send masked PONG (0x8A)
+                self.close_frames_received += 1
+                if len(payload) == 1:
+                    await self._abort_transport()
+                    raise WebSocketProtocolError("CLOSE frame payload cannot be 1 byte (RFC 6455 §5.5.1)")
+                elif len(payload) >= 2:
+                    close_code = struct.unpack("!H", payload[:2])[0]
+                    close_reason = payload[2:].decode("utf-8", errors="replace")
+                    reply_payload = payload[:2]
+                else:
+                    close_code = 1005
+                    close_reason = ""
+                    reply_payload = struct.pack("!H", 1000)
+
+                self.last_close_code = close_code
+                self.last_close_reason = close_reason
+                if not self._close_sent:
+                    self._close_sent = True
+                    try:
+                        await self._send_masked_frame(0x8, reply_payload)
+                    except Exception:
+                        pass
+                await self._abort_transport()
+                raise WebSocketClosedError(close_code=close_code, close_reason=close_reason)
+
+            if opcode == 0x9:  # PING -> reply with masked PONG (0xA) echoing exact payload
+                self.pings_received_and_replied += 1
+                self.last_ping_payload = payload
                 await self._send_masked_frame(0xA, payload)
                 continue
+
             if opcode == 0xA:  # PONG
+                self.pongs_received += 1
+                self.last_pong_payload = payload
                 continue
 
+            # Handle Data Frames (0x1 TEXT, 0x2 BINARY, 0x0 CONTINUATION)
+            if opcode == 0x0:
+                if not fragments:
+                    await self._abort_transport()
+                    raise WebSocketProtocolError("Received CONTINUATION frame (0x0) with no active fragmented message")
+            elif opcode in (0x1, 0x2):
+                if fragments:
+                    await self._abort_transport()
+                    raise WebSocketProtocolError(
+                        f"Received new data frame (opcode=0x{opcode:x}) before previous fragmented message finished"
+                    )
+            else:
+                await self._abort_transport()
+                raise WebSocketProtocolError(f"Unsupported WebSocket opcode: 0x{opcode:x}")
+
+            accumulated_bytes += len(payload)
+            if accumulated_bytes > self.max_message_bytes:
+                await self._abort_transport()
+                raise WebSocketProtocolError(
+                    f"Reassembled message ({accumulated_bytes} B) exceeds max_message_bytes ({self.max_message_bytes} B)"
+                )
+
             fragments.append(payload)
+            fragment_count += 1
+
             if fin:
                 recv_mono = monotonic_ns()
                 recv_utc = utc_now()
+                if fragment_count > 1:
+                    self.fragmented_messages_reassembled += 1
                 full_bytes = b"".join(fragments)
                 return json.loads(full_bytes.decode("utf-8")), recv_utc, recv_mono
 
@@ -930,16 +1275,25 @@ class BinanceSpotWebSocketStream:
         self._writer.write(bytes(header) + masked_payload)
         await self._writer.drain()
 
-    async def close(self) -> None:
+    async def _abort_transport(self) -> None:
         if self._writer is not None:
             try:
-                await self._send_masked_frame(0x8, b"")
                 self._writer.close()
                 await self._writer.wait_closed()
             except Exception:
                 pass
             self._writer = None
             self._reader = None
+
+    async def close(self, code: int = 1000) -> None:
+        if self._writer is not None:
+            try:
+                if not self._close_sent:
+                    self._close_sent = True
+                    await self._send_masked_frame(0x8, struct.pack("!H", code))
+            except Exception:
+                pass
+            await self._abort_transport()
 
 
 def _current_rss_bytes() -> int:
@@ -1029,6 +1383,7 @@ async def run_live_f01_daemon(
                             exporter.write_shard("MIXED", "market_events", pending_shard_records)
                             pending_shard_records.clear()
                         lat = collector.compute_latency_percentiles()
+                        bp = collector.get_backpressure_telemetry()
                         return {
                             "total_valid_events": collector.total_valid_events_processed,
                             "latency_p50_ms": str(lat.p50_ms),
@@ -1038,6 +1393,9 @@ async def run_live_f01_daemon(
                             "within_slo": lat.within_slo,
                             "rss_mib": round(_current_rss_bytes() / (1024 * 1024), 2),
                             "data_quality": collector.quality_guard.current_quality.value,
+                            "tls_version": ws.tls_version,
+                            "tls_cipher": ws.tls_cipher,
+                            "critical_dropped_count": bp.critical_dropped_count,
                         }
 
                     # 5s heartbeat update
