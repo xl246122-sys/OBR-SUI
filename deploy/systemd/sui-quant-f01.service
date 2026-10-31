@@ -1,0 +1,29 @@
+[Unit]
+Description=SUI-Quant F-01 Real-Time Market Collector & Dual-Tier Scanner
+After=network-online.target sui-quant-r01.service sui-quant-guardian.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=sui-quant-circuit-breaker@%n.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sui-quant
+Environment="PYTHONPATH=/opt/sui-quant/src"
+Environment="SUI_QUANT_MODE=PAPER"
+ExecStart=/usr/bin/python3 -m sui_quant.data.collector --db-path /var/lib/sui-quant/state.db --spool-dir /var/lib/sui-quant/spool
+Restart=on-failure
+RestartSec=3s
+TimeoutStopSec=15s
+Nice=-2
+CPUWeight=200
+MemoryHigh=120M
+MemoryMax=320M
+OOMScoreAdjust=-200
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

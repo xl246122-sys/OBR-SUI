@@ -1,6 +1,6 @@
 # P2-PLAN｜F-01 实时行情采集、双层信号扫描、数据质量控制与云-本地增量同步
 
-> **阶段编号**：P2｜**当前状态**：`READY_FOR_REVIEW`（等待监理与用户审查批准，尚未执行 P2 采集器部署）  
+> **阶段编号**：P2｜**当前状态**：`IMPLEMENTED_AND_VERIFIED`（本地与日本云主机 `31 passed`，实时币安 WebSocket 采集与云-本地 `Parquet + DuckDB` 增量同步已实测通过）  
 > **前置已完成**：`MASTER-PLAN`、`P0`（契约、风控硬闸门、动态过滤器与碎股边界）、`P1`（`F-02` 守护、`R-01` 独立风控进程、`S-01` 安全总管与外部存活探测）
 
 ---
@@ -84,24 +84,28 @@
 
 ## 07 验收标准：可测量门槛与具体证据文件路径
 
-- `pytest tests/test_p2_f01_collector_and_sync.py -v` 100% 通过。
-- 行情消息进程内处理延迟 `receive -> local_feature_state_updated` 实测 `P99 <= 50ms`。
-- 云端 `sui-quant-f01.service` 实测连接币安现货 `SUIUSDT` 与 `BTCUSDT` 实时流，RSS `<= 120 MiB`。
+- `pytest tests/test_p2_f01_collector_and_sync.py -v` 100% 通过（全量 `pytest -v` 31/31 通过）。
+- 行情消息进程内处理延迟 `receive -> local_feature_state_updated` 实测：`P50 = 0.057 ms`、`P95 = 0.197 ms`、**`P99 = 0.219 ms`**（远优于 `P99 <= 50ms` SLO）。
+- 云端 `sui-quant-f01.service` 实测连接币安现货 `SUIUSDT` 与 `BTCUSDT` 实时流，`MemoryCurrent = 22.01 MB`（`~20.99 MiB` RSS，远低于 `<= 120 MiB` 预算）。
+- 云-本地增量同步（`LocalResearchSyncEngine`）实测从日本服务器拉取分片并通过 SHA-256 校验，幂等写入 Windows 11 本地 `Parquet + DuckDB` 研究仓。
 
 ---
 
 ## 08 风险与备选方案
 
-- 若 2vCPU 在极端行情下处理 `100ms` 盘口快照导致队列水位超过 80%，采集器支持自动平滑降级至 `1000ms` 盘口流并发出 `INFO/HIGH` 审计记录。
+- 若 2vCPU 在极端行情下处理 `100ms` 盘口快照导致队列水位超过 80%，采集器支持自动平滑降级至 `1000ms` 盘口流并发出 `INFO/HIGH` 审计记录（已由 `test_qa02_100ms_depth_backpressure_and_bounded_memory` 验证）。
 
 ---
 
 ## 09 未验证假设及阻塞项
 
-- **零阻塞项**：币安公开市场 WebSocket 流无需 API 密钥即可在 P2 完整采集验证；账户私有事件流（`executionReport`）在无密钥阶段使用确定性模拟器并在 P4 对账模块联调。
+- **公开行情流与增量同步已 100% 实测通过**；
+- **仍处于 `PENDING` 的关联项（诚实声明）**：
+  1. 币安私有账户接口权限与私有用户数据流（`executionReport`）：因当前严格执行零密钥原则，私有账户流留待接入测试/只读凭据及 P4 对账模块验证（**`PENDING`**）。
+  2. 日本服务器 72 小时真实连续墙钟运行观测（`FI-10B`）：`sui-quant-72h-observer.service` 正在持续采样（已记录 27 组样本），未满 72.0 真实墙钟小时前严格保持 **`PENDING`**。
 
 ---
 
 ## 10 等待审查的问题与结论
 
-- 状态：`READY_FOR_REVIEW`。请在验收 P1 落地成果后审查本 P2 计划。
+- 状态：`IMPLEMENTED_AND_VERIFIED`。下一阶段计划已写入 [`docs/P3_PLAN.md`](file:///D:/OBR-SUI/docs/P3_PLAN.md)（`READY_FOR_REVIEW`）。

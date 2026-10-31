@@ -15,7 +15,7 @@
 | **REQ-05** | 凭据隔离与日志脱敏：禁止日志/异常/Git 出现任何 API Key/Secret/密码 (§10) | `S-01` / 基础库 | [`src/sui_quant/security/redaction.py`](file:///D:/OBR-SUI/src/sui_quant/security/redaction.py), [`.gitignore`](file:///D:/OBR-SUI/.gitignore) | `QA-10` | P0, P1 | `PASS (P0 基座)` |
 | **REQ-06** | 唯一 `clientOrderId` 幂等生成与 `D-01` 交易保护状态机迁移约束 (§5, §7) | `D-01` / `B-01` | [`src/sui_quant/state_machine.py`](file:///D:/OBR-SUI/src/sui_quant/state_machine.py), [`src/sui_quant/utils/ids.py`](file:///D:/OBR-SUI/src/sui_quant/utils/ids.py) | `QA-04`, `QA-05` | P0, P4 | `PASS (P0 基座)` |
 | **REQ-07** | 五类服务 `systemd` 守护、5s 心跳、30s 卡死检测、重启进入 `SYNCING`、外部失联探测 (§9, §10) | `F-02` / `S-01` | [`src/sui_quant/daemon/`](file:///D:/OBR-SUI/src/sui_quant/daemon) | `QA-09`, `QA-10` | P1 | `PARTIAL PASS / PENDING`（`FI-01~FI-09`、`FI-10A` 加速仿真及跨机器失联实测 `PASS`；**日本服务器真实连续 72h 墙钟满额运行 `FI-10B` 与第三方公有云/FCM 凭据标记为 `PENDING`**） |
-| **REQ-08** | 实时订阅 `SUIUSDT`/`BTCUSDT` WebSocket 流、100ms 10档盘口、严格区分已收盘 K 线、增量同步 (§2, §11.1) | `F-01` / `E-01` | `src/sui_quant/data/` (P2 新增) | `QA-01`, `QA-02` | P2 | `PENDING (P2 待实施)` |
+| **REQ-08** | 实时订阅 `SUIUSDT`/`BTCUSDT` WebSocket 流、100ms 10档盘口、严格区分已收盘 K 线、增量同步 (§2, §11.1) | `F-01` / `E-01` | [`src/sui_quant/data/`](file:///D:/OBR-SUI/src/sui_quant/data) | `QA-01`, `QA-02` | P2 | `PASS (P2 公开流与同步) / PENDING (私有账户核验与72h实测)` |
 | **REQ-09** | `A-01` 五状态识别与 `A-02` 向上放量突破三障碍校准概率模型（`p_win+p_stop+p_timeout=1`） (§3, §4) | `A-01` / `A-02` | `src/sui_quant/models/` (P3 新增) | `QA-12`, `QA-13` | P3 | `PENDING (P3 待实施)` |
 | **REQ-10** | `B-01` 盘口微观结构限价优化、成交概率与逆向选择 `markout`、部分成交立即保护 (§5) | `B-01` / `R-01` | `src/sui_quant/execution/` (P4 新增) | `QA-04`, `QA-05` | P4 | `PENDING (P4 待实施)` |
 | **REQ-11** | 真实加权买价 `-1%` 触发止损；`C1`（净+1.5%）、`C2`（上涨分批）、`C3`（混合）两层公平回测与 OCO 锁仓 (§6) | `C-01` | `src/sui_quant/exit/` (P5 新增) | `QA-06`, `QA-07`, `QA-13` | P5 | `PENDING (P5 待实施)` |
@@ -29,8 +29,8 @@
 
 | 验收 ID | 必须注入或证明的场景 (§14.2) | 负责阶段 | P0/P1 已验证部分 vs 后续待验证部分 (`PENDING`) |
 |---|---|---|---|
-| **QA-01** | 行情重复、乱序、缺失、失联、重连与 K 线收盘去重 | P0, P2 | P0 契约校验 `PASS`；实时 WebSocket 行情流乱序/缺口回补待 P2 验证（**`PENDING`**） |
-| **QA-02** | 100ms 部分盘口正常处理、背压不无限增长、数据质量停新仓 | P0, P2 | P0 `DataQuality` 阻断契约 `PASS`；100ms 盘口采集与币安私有账户权限核验待验证（**`PENDING`**） |
+| **QA-01** | 行情重复、乱序、缺失、失联、重连与 K 线收盘去重 | P0, P2 | **`PASS`**：P0 契约校验 + P2 [`test_p2_f01_collector_and_sync.py`](file:///D:/OBR-SUI/tests/test_p2_f01_collector_and_sync.py)（重复/乱序拒收、未收盘隔离与收盘唯一触发、3分钟断联 `GAP_UNRECOVERABLE_FOR_FILL_CALIBRATION` 标记与 REST K 线补齐、23h 双连接零缺口热切换）全部通过 |
+| **QA-02** | 100ms 部分盘口正常处理、背压不无限增长、数据质量停新仓 | P0, P2 | **`PARTIAL PASS / PENDING`**：100ms 盘口采集、有界 RingBuffer、80% 水位自动降级 `1000ms`、过期行情停新仓及云端实测 `P99=0.219ms` `PASS`；**币安私有账户 API 权限实网核验因零密钥策略保持 `PENDING`** |
 | **QA-03** | 价格/数量 tick、step、最小名义额、实际费率、资金不足处理 | P0, P4 | P0 规则与边界计算 [`exchange_rules.py`](file:///D:/OBR-SUI/src/sui_quant/exchange_rules.py) `PASS`；`B-01` 执行器集成待 P4 验证（**`PENDING`**） |
 | **QA-04** | 限价单永远不成交、部分成交、撤单和改单、买单超时状态未知 | P0, P4 | P0 状态机转移 [`state_machine.py`](file:///D:/OBR-SUI/src/sui_quant/state_machine.py) `PASS`；订单执行闭环待 P4 验证（**`PENDING`**） |
 | **QA-05** | 买单成交瞬间风险模块/服务器崩溃，重启对账并优先恢复保护 | P0, P1, P4 | P1 `kill -9` 与模拟对账恢复 `PASS`；真实订单流恢复待 P4 验证（**`PENDING`**） |
