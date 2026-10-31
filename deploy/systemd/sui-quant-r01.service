@@ -1,0 +1,28 @@
+[Unit]
+Description=SUI-Quant R-01 Independent Risk Daemon (PAPER Default, Zero ML)
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=sui-quant-circuit-breaker@%n.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sui-quant
+Environment="PYTHONPATH=/opt/sui-quant/src"
+Environment="SUI_QUANT_MODE=PAPER"
+ExecStart=/usr/bin/python3 -m sui_quant.daemon.soak_runner --mode service --service-name r01 --db-path /var/lib/sui-quant/state.db
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=15s
+Nice=-10
+CPUWeight=500
+MemoryHigh=90M
+MemoryMax=120M
+OOMScoreAdjust=-500
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

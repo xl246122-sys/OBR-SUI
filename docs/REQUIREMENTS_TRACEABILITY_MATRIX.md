@@ -14,7 +14,7 @@
 | **REQ-04** | `SUIUSDT` 价格 `tickSize=0.0001`、数量 `stepSize=0.1`、`minNotional=5.0` 及扣费碎股向下取整校验 (§5, §6.2) | `B-01` / `C-01` / `R-01` | [`src/sui_quant/exchange_rules.py`](file:///D:/OBR-SUI/src/sui_quant/exchange_rules.py) | `QA-03`, `QA-06` | P0, P4, P5 | `PASS (P0 基座)` |
 | **REQ-05** | 凭据隔离与日志脱敏：禁止日志/异常/Git 出现任何 API Key/Secret/密码 (§10) | `S-01` / 基础库 | [`src/sui_quant/security/redaction.py`](file:///D:/OBR-SUI/src/sui_quant/security/redaction.py), [`.gitignore`](file:///D:/OBR-SUI/.gitignore) | `QA-10` | P0, P1 | `PASS (P0 基座)` |
 | **REQ-06** | 唯一 `clientOrderId` 幂等生成与 `D-01` 交易保护状态机迁移约束 (§5, §7) | `D-01` / `B-01` | [`src/sui_quant/state_machine.py`](file:///D:/OBR-SUI/src/sui_quant/state_machine.py), [`src/sui_quant/utils/ids.py`](file:///D:/OBR-SUI/src/sui_quant/utils/ids.py) | `QA-04`, `QA-05` | P0, P4 | `PASS (P0 基座)` |
-| **REQ-07** | 五类服务 `systemd` 守护、5s 心跳、30s 卡死检测、重启进入 `SYNCING`、外部失联探测 (§9, §10) | `F-02` / `S-01` | `src/sui_quant/daemon/` (P1 新增) | `QA-09`, `QA-10` | P1 | `PLANNED (P1)` |
+| **REQ-07** | 五类服务 `systemd` 守护、5s 心跳、30s 卡死检测、重启进入 `SYNCING`、外部失联探测 (§9, §10) | `F-02` / `S-01` | [`src/sui_quant/daemon/`](file:///D:/OBR-SUI/src/sui_quant/daemon) | `QA-09`, `QA-10` | P1 | `PASS (P1 已验收)` |
 | **REQ-08** | 实时订阅 `SUIUSDT`/`BTCUSDT` WebSocket 流、100ms 10档盘口、严格区分已收盘 K 线、增量同步 (§2, §11.1) | `F-01` / `E-01` | `src/sui_quant/data/` (P2 新增) | `QA-01`, `QA-02` | P2 | `PLANNED (P2)` |
 | **REQ-09** | `A-01` 五状态识别与 `A-02` 向上放量突破三障碍校准概率模型（`p_win+p_stop+p_timeout=1`） (§3, §4) | `A-01` / `A-02` | `src/sui_quant/models/` (P3 新增) | `QA-12`, `QA-13` | P3 | `PLANNED (P3)` |
 | **REQ-10** | `B-01` 盘口微观结构限价优化、成交概率与逆向选择 `markout`、部分成交立即保护 (§5) | `B-01` / `R-01` | `src/sui_quant/execution/` (P4 新增) | `QA-04`, `QA-05` | P4 | `PLANNED (P4)` |
@@ -37,8 +37,8 @@
 | **QA-06** | 止盈/止损组合订单数量锁定，不存在重复占用或裸仓误判 | P0, P5 | P0 已在 `PositionLedger` 实现 `reserved_qty <= actual_qty` 强校验与碎股向下取整 |
 | **QA-07** | 快速跳价、-1% 触发实际亏损超过 1%、压力滑点、触发订单拒绝 | P0, P5 | P0 已在 `RiskConfig` 区分 `-1%` 价格触发线与含滑点/手续费的压力风险预算 |
 | **QA-08** | 24h 权益阈值、仓位上限、权限/配置被恶意放宽时拒绝 | P0, P4 | P0 已在 [`config.py`](file:///D:/OBR-SUI/src/sui_quant/config.py) 实现不可放宽硬边界并由单元测试通过 |
-| **QA-09** | systemd 崩溃/卡死/开机重启/网络中断/磁盘满/时钟异常 | P1 | P1 实施并注入测试 |
-| **QA-10** | SSH 异常成功登录、文件篡改、密钥泄漏演练、外部服务器掉线告警 | P0, P1 | P0 已落地日志脱敏与主机防火墙/SSH/Fail2Ban 加固；P1 落地守护与外部探测 |
+| **QA-09** | systemd 崩溃/卡死/开机重启/网络中断/磁盘满/时钟异常 | P1 | `PASS (P1 FI-01~FI-10 全部通过)` |
+| **QA-10** | SSH 异常成功登录、文件篡改、密钥泄漏演练、外部服务器掉线告警 | P0, P1 | `PASS (P0+P1 已落地并通过注入验证)` |
 | **QA-11** | Android 前后台通知、权限被拒、FCM 延迟/丢弃、断网告警补偿 | P7 | P7 实施并测试 |
 | **QA-12** | 模型热切换/失败回滚/旧持仓策略版本锁定/旧模型兼容 | P0, P6 | P0 已在 `PositionLedger(exit_strategy_version)` 与 `ModelManifest(rollback_ref)` 冻结字段 |
 | **QA-13** | 不同止盈方案 C1/C2/C3 严格同入场、同风控、同费用对照 | P5 | P5 实施两层公平回测 |

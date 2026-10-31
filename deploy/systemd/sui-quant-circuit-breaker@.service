@@ -1,0 +1,10 @@
+[Unit]
+Description=SUI-Quant Crash-Loop Circuit Breaker for %i
+
+[Service]
+Type=oneshot
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/sui-quant
+Environment="PYTHONPATH=/opt/sui-quant/src"
+ExecStart=/usr/bin/python3 -c "from sui_quant.daemon.storage import StateStore; from sui_quant.state_machine import TradingState; s = StateStore('/var/lib/sui-quant/state.db'); s.set_trading_state(TradingState.ENTRY_FROZEN); s.close()"
